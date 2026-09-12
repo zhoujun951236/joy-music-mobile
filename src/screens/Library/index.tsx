@@ -46,6 +46,11 @@ import {
 } from '../../core/config/musicSource'
 import { audioFileCache, formatCacheSize, type CachedAudioFileEntry } from '../../core/music/audioCache'
 import { clearTrackCacheById } from '../../core/music/cache'
+import {
+  localMusicLibrary,
+  type LocalMusicEntry,
+  type LocalMusicStats,
+} from '../../core/music/localLibrary'
 import { playerController } from '../../core/player'
 import QueueSheet from '../NowPlaying/QueueSheet'
 import { emitScrollTopState, subscribeScrollToTop } from '../../core/ui/scrollToTopBus'
@@ -66,7 +71,7 @@ interface LibraryScreenProps {
   onDetailVisibilityChange?: (visible: boolean) => void
 }
 
-type LibrarySubPage = 'main' | 'appearance' | 'sources' | 'cache' | 'logs' | 'about'
+type LibrarySubPage = 'main' | 'appearance' | 'sources' | 'cache' | 'local' | 'logs' | 'about'
 type SourceModalMode = 'manual' | 'url'
 
 interface MotionPressableProps {
@@ -161,6 +166,12 @@ type CacheSortMode = 'recent' | 'size'
 /** 缓存列表最多渲染的条数，超出部分可用搜索定位，避免超长列表拖慢设置页 */
 const CACHE_LIST_RENDER_LIMIT = 200
 
+/** 主页"本地音乐"只预览前几首，其余进"管理全部" */
+const MAIN_LOCAL_PREVIEW_COUNT = 6
+
+/** 本地音乐子页最多渲染的条数 */
+const LOCAL_LIST_RENDER_LIMIT = 300
+
 const CACHE_SOURCE_LABELS: Record<string, string> = {
   joy: 'Joy',
   wy: '网易云',
@@ -192,6 +203,26 @@ function formatCachedAt(timestamp: number): string {
 
 function buildCacheEntriesSignature(entries: CachedAudioFileEntry[]): string {
   return entries.map((entry) => `${entry.musicId}:${entry.size}:${entry.updatedAt}`).join('|')
+}
+
+/** 本地导入文件转成播放用 Track：source 固定 local，用于全 App 的"本地文件"标识 */
+function localEntryToTrack(entry: LocalMusicEntry): Track {
+  return {
+    id: entry.id,
+    title: entry.title || '未知歌曲',
+    artist: entry.artist || '本地文件',
+    duration: 0,
+    url: entry.fileUri,
+    source: 'local',
+  }
+}
+
+function formatLocalMeta(entry: LocalMusicEntry): string {
+  return [
+    (entry.format || '').toUpperCase(),
+    formatCacheSize(entry.size),
+    formatCachedAt(entry.importedAt).replace('缓存', '导入'),
+  ].filter(Boolean).join(' · ')
 }
 
 function MotionPressable({
@@ -306,6 +337,96 @@ const CachedSongRow = React.memo(function CachedSongRow({
   )
 })
 
+interface LocalTrackRowProps {
+  entry: LocalMusicEntry
+  colors: ThemeColors
+  deleting: boolean
+  isCurrentTrack: boolean
+  reducedMotion: boolean
+  isLast: boolean
+  onPlay: (entry: LocalMusicEntry) => void
+  onDelete: (entry: LocalMusicEntry) => void
+}
+
+const LocalTrackRow = React.memo(function LocalTrackRow({
+  entry,
+  colors,
+  deleting,
+  isCurrentTrack,
+  reducedMotion,
+  isLast,
+  onPlay,
+  onDelete,
+}: LocalTrackRowProps) {
+  const title = entry.title?.trim() || '未知歌曲'
+  const subtitle = entry.missing
+    ? '文件已丢失，可删除后重新导入'
+    : (entry.artist?.trim() || '未知歌手')
+
+  return (
+    <View
+      style={[
+        styles.cacheRow,
+        !isLast && {
+          borderBottomWidth: StyleSheet.hairlineWidth,
+          borderBottomColor: colors.separator,
+        },
+      ]}
+    >
+      <TouchableOpacity
+        style={styles.localRowMain}
+        activeOpacity={0.6}
+        disabled={entry.missing}
+        onPress={() => onPlay(entry)}
+        accessibilityLabel={`播放本地歌曲 ${title}`}
+      >
+        <View style={[styles.cacheRowIcon, { backgroundColor: colors.accentLight }]}>
+          <Ionicons
+            name={entry.missing ? 'alert-circle-outline' : isCurrentTrack ? 'volume-high' : 'folder-outline'}
+            size={16}
+            color={entry.missing ? colors.warning : colors.accent}
+          />
+        </View>
+
+        <View style={styles.cacheRowMeta}>
+          <View style={styles.localRowTitleRow}>
+            <Text style={[styles.cacheRowTitle, { color: colors.text }]} numberOfLines={1}>
+              {title}
+            </Text>
+            <View style={[styles.localBadge, { backgroundColor: colors.accentLight }]}>
+              <Text style={[styles.localBadgeText, { color: colors.accent }]}>本地文件</Text>
+            </View>
+          </View>
+          <Text
+            style={[styles.cacheRowSubtitle, { color: entry.missing ? colors.warning : colors.textSecondary }]}
+            numberOfLines={1}
+          >
+            {subtitle}{isCurrentTrack && !entry.missing ? ' · 正在播放' : ''}
+          </Text>
+          {!entry.missing && (
+            <Text style={[styles.cacheRowInfo, { color: colors.textTertiary }]} numberOfLines={1}>
+              {formatLocalMeta(entry)}
+            </Text>
+          )}
+        </View>
+      </TouchableOpacity>
+
+      <MotionPressable
+        onPress={() => onDelete(entry)}
+        reducedMotion={reducedMotion}
+        disabled={deleting}
+        style={[styles.cacheRowDeleteBtn, { backgroundColor: 'rgba(255,59,48,0.14)' }]}
+      >
+        <View style={styles.cacheRowDeleteInner}>
+          {deleting
+            ? <ActivityIndicator size="small" color={colors.danger} />
+            : <Ionicons name="trash-outline" size={15} color={colors.danger} />}
+        </View>
+      </MotionPressable>
+    </View>
+  )
+})
+
 function EntryCard({ icon, title, subtitle, onPress, reducedMotion }: EntryCardProps) {
   const { colors } = useTheme()
   return (
@@ -405,6 +526,12 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
   const [cacheSortMode, setCacheSortMode] = useState<CacheSortMode>('recent')
   const [deletingCacheIds, setDeletingCacheIds] = useState<Record<string, boolean>>({})
   const cacheEntriesSignatureRef = useRef('')
+  const [localEntries, setLocalEntries] = useState<LocalMusicEntry[]>([])
+  const [localStats, setLocalStats] = useState<LocalMusicStats>({ count: 0, sizeBytes: 0, missingCount: 0 })
+  const [localImporting, setLocalImporting] = useState(false)
+  const [localKeyword, setLocalKeyword] = useState('')
+  const [localSortMode, setLocalSortMode] = useState<CacheSortMode>('recent')
+  const [deletingLocalIds, setDeletingLocalIds] = useState<Record<string, boolean>>({})
   const [logExporting, setLogExporting] = useState(false)
   const [runtimeLogCount, setRuntimeLogCount] = useState(0)
   const [runtimeLastTimestamp, setRuntimeLastTimestamp] = useState<number | null>(null)
@@ -422,9 +549,11 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
         ? '自定义源管理'
         : subPage === 'cache'
           ? '缓存管理'
-          : subPage === 'logs'
-            ? '运行日志'
-          : '关于'
+          : subPage === 'local'
+            ? '本地音乐'
+            : subPage === 'logs'
+              ? '运行日志'
+              : '关于'
 
   const queueCount = playerState.playlist.length
   const currentTrackId = playerState.currentTrack?.id ?? null
@@ -441,6 +570,21 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
       ? matched.sort((a, b) => b.size - a.size)
       : matched
   }, [cacheEntries, cacheKeyword, cacheSortMode])
+  const localSummaryText = localStats.count
+    ? `${localStats.count} 首 · ${formatCacheSize(localStats.sizeBytes)}`
+    : '未导入歌曲'
+  const visibleLocalEntries = useMemo(() => {
+    const keyword = localKeyword.trim().toLowerCase()
+    const matched = keyword
+      ? localEntries.filter((entry) => {
+        const haystack = `${entry.title || ''} ${entry.artist || ''} ${entry.fileName}`.toLowerCase()
+        return haystack.includes(keyword)
+      })
+      : [...localEntries]
+    return localSortMode === 'size'
+      ? matched.sort((a, b) => b.size - a.size)
+      : matched
+  }, [localEntries, localKeyword, localSortMode])
   const runtimeLogSummaryText = runtimeLogCount
     ? `${runtimeLogCount} 条 · 最近 ${formatDateTime(runtimeLastTimestamp)}`
     : '暂无运行日志'
@@ -540,8 +684,8 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
 
   const handleClearAudioCache = useCallback(() => {
     const summary = cacheFileCount
-      ? `确认删除全部 ${cacheFileCount} 首已缓存歌曲（${formatCacheSize(cacheSizeBytes)}）吗？删除后将重新走在线获取。`
-      : '确认删除所有已缓存歌曲吗？删除后将重新走在线获取。'
+      ? `确认删除全部 ${cacheFileCount} 首在线缓存歌曲（${formatCacheSize(cacheSizeBytes)}）吗？删除后将重新走在线获取。从「文件」导入的本地歌曲不会被删除。`
+      : '确认删除所有在线缓存歌曲吗？删除后将重新走在线获取。从「文件」导入的本地歌曲不会被删除。'
     Alert.alert('清空本地缓存', summary, [
       { text: '取消', style: 'cancel' },
       {
@@ -570,6 +714,127 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
   const handleToggleCacheSort = useCallback(() => {
     setCacheSortMode((prev) => (prev === 'recent' ? 'size' : 'recent'))
   }, [])
+
+  const loadLocalLibrary = useCallback(async() => {
+    const [entries, stats] = await Promise.all([
+      localMusicLibrary.getEntries(),
+      localMusicLibrary.getStats(),
+    ])
+    setLocalEntries(entries)
+    setLocalStats(stats)
+  }, [])
+
+  /** 从"文件"App 选取音频，复制进 App 并按"歌名-歌手"解析登记 */
+  const handleImportLocalMusicFiles = useCallback(async() => {
+    if (localImporting) return
+    setLocalImporting(true)
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ['audio/*', 'public.audio'],
+        copyToCacheDirectory: false,
+        multiple: true,
+      })
+      if (result.canceled) return
+
+      const assets = (result.assets || [])
+        .filter((asset) => Boolean(asset?.uri))
+        .map((asset) => ({ uri: asset.uri, name: asset.name, size: asset.size }))
+      if (!assets.length) {
+        Alert.alert('未选择文件', '没有读取到可导入的音频文件')
+        return
+      }
+
+      const importResult = await localMusicLibrary.importFiles(assets)
+      await loadLocalLibrary()
+
+      const lines: string[] = []
+      if (importResult.imported.length) {
+        lines.push(`新导入 ${importResult.imported.length} 首`)
+      }
+      if (importResult.replaced.length) {
+        lines.push(`覆盖同名 ${importResult.replaced.length} 首`)
+      }
+      if (importResult.skipped.length) {
+        const preview = importResult.skipped
+          .slice(0, 3)
+          .map((item) => `${item.name}（${item.reason}）`)
+          .join('\n')
+        const rest = importResult.skipped.length > 3
+          ? `\n等 ${importResult.skipped.length} 个文件`
+          : ''
+        lines.push(`跳过 ${importResult.skipped.length} 个：\n${preview}${rest}`)
+      }
+      if (!importResult.imported.length && !importResult.replaced.length) {
+        Alert.alert('没有导入成功', lines.join('\n') || '请确认所选文件是音频格式')
+        return
+      }
+      Alert.alert('导入完成', `${lines.join('\n')}\n\n文件名按"歌名-歌手"解析，可在列表中核对。`)
+    } catch (error) {
+      Alert.alert('导入失败', error instanceof Error ? error.message : '读取文件失败')
+    } finally {
+      setLocalImporting(false)
+    }
+  }, [loadLocalLibrary, localImporting])
+
+  const handlePlayLocalTrack = useCallback((entry: LocalMusicEntry) => {
+    if (entry.missing) {
+      Alert.alert('文件已丢失', `「${entry.title}」的本地文件已不存在，可删除该记录后重新导入。`)
+      return
+    }
+    const track = localEntryToTrack(entry)
+    if (onTrackPress) {
+      onTrackPress(track)
+      return
+    }
+    void playerController.insertTrackAndPlay(track, { autoPlay: true })
+  }, [onTrackPress])
+
+  const handleDeleteLocalTrack = useCallback((entry: LocalMusicEntry) => {
+    if (deletingLocalIds[entry.id]) return
+    const isCurrentTrack = (currentTrackIdRef.current || '') === entry.id
+    Alert.alert(
+      '删除本地歌曲',
+      `确认删除「${entry.title}」吗？会一并删掉 App 内的文件副本，之后需要重新导入。`,
+      [
+        { text: '取消', style: 'cancel' },
+        {
+          text: '删除',
+          style: 'destructive',
+          onPress: () => {
+            void (async() => {
+              setDeletingLocalIds((prev) => ({ ...prev, [entry.id]: true }))
+              try {
+                await localMusicLibrary.removeEntry(entry.id)
+                await loadLocalLibrary()
+                if (isCurrentTrack) {
+                  await playerController.pause().catch(() => {})
+                }
+              } catch (error) {
+                Alert.alert('删除失败', error instanceof Error ? error.message : '请稍后重试')
+              } finally {
+                setDeletingLocalIds((prev) => {
+                  if (!prev[entry.id]) return prev
+                  const next = { ...prev }
+                  delete next[entry.id]
+                  return next
+                })
+              }
+            })()
+          },
+        },
+      ]
+    )
+  }, [deletingLocalIds, loadLocalLibrary])
+
+  const handleToggleLocalSort = useCallback(() => {
+    setLocalSortMode((prev) => (prev === 'recent' ? 'size' : 'recent'))
+  }, [])
+
+  const handlePruneMissingLocal = useCallback(async() => {
+    const removed = await localMusicLibrary.pruneMissing()
+    await loadLocalLibrary()
+    Alert.alert('已清理', removed ? `已移除 ${removed} 条失效记录` : '没有失效记录')
+  }, [loadLocalLibrary])
 
   const refreshRuntimeLogState = useCallback(() => {
     const stats = getRuntimeLogStats()
@@ -868,6 +1133,16 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
   }, [currentTrackId])
 
   useEffect(() => {
+    void loadLocalLibrary()
+  }, [loadLocalLibrary])
+
+  useEffect(() => {
+    // 导入/删除可能在别的子页发生，进入这两个页面时重新读一次索引
+    if (subPage !== 'local' && subPage !== 'cache') return
+    void loadLocalLibrary()
+  }, [loadLocalLibrary, subPage])
+
+  useEffect(() => {
     refreshRuntimeLogState()
     return subscribeRuntimeLogs(refreshRuntimeLogState)
   }, [refreshRuntimeLogState])
@@ -1050,6 +1325,79 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
 
       <View style={styles.section}>
         <View style={styles.sectionHeader}>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>本地音乐</Text>
+          <Text style={[styles.sectionSubtitle, { color: colors.textSecondary }]}>
+            {localImporting ? '导入中...' : localSummaryText}
+          </Text>
+        </View>
+
+        <View style={styles.actionsRow}>
+          <MotionPressable
+            onPress={handleImportLocalMusicFiles}
+            reducedMotion={reduceMotionEnabled}
+            disabled={localImporting}
+            style={[styles.actionBtn, { backgroundColor: colors.surfaceSecondary }]}
+          >
+            <View style={styles.actionBtnContent}>
+              {localImporting
+                ? <ActivityIndicator size="small" color={colors.textSecondary} />
+                : <Ionicons name="folder-open-outline" size={15} color={colors.textSecondary} />}
+              <Text style={[styles.actionText, { color: colors.textSecondary }]}>从文件导入</Text>
+            </View>
+          </MotionPressable>
+
+          <MotionPressable
+            onPress={() => navigateToSubPage('local')}
+            reducedMotion={reduceMotionEnabled}
+            style={[styles.actionBtn, { backgroundColor: colors.surfaceSecondary }]}
+          >
+            <View style={styles.actionBtnContent}>
+              <Ionicons name="list-outline" size={15} color={colors.textSecondary} />
+              <Text style={[styles.actionText, { color: colors.textSecondary }]}>管理全部</Text>
+            </View>
+          </MotionPressable>
+        </View>
+
+        <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.separator }]}>
+          {localEntries.length === 0 && (
+            <View style={styles.cacheEmptyWrap}>
+              <Ionicons name="folder-outline" size={22} color={colors.textTertiary} />
+              <Text style={[styles.cacheEmptyText, { color: colors.textSecondary }]}>
+                还没有导入歌曲，从「文件」App 选择音频即可
+              </Text>
+            </View>
+          )}
+
+          {localEntries.slice(0, MAIN_LOCAL_PREVIEW_COUNT).map((entry, index) => (
+            <LocalTrackRow
+              key={entry.id}
+              entry={entry}
+              colors={colors}
+              deleting={Boolean(deletingLocalIds[entry.id])}
+              isCurrentTrack={currentTrackId === entry.id}
+              reducedMotion={reduceMotionEnabled}
+              isLast={index === Math.min(localEntries.length, MAIN_LOCAL_PREVIEW_COUNT) - 1}
+              onPlay={handlePlayLocalTrack}
+              onDelete={handleDeleteLocalTrack}
+            />
+          ))}
+
+          {localEntries.length > MAIN_LOCAL_PREVIEW_COUNT && (
+            <TouchableOpacity
+              style={[styles.cacheMoreHint, { borderTopColor: colors.separator }]}
+              activeOpacity={0.6}
+              onPress={() => navigateToSubPage('local')}
+            >
+              <Text style={[styles.cacheMoreHintText, { color: colors.accent }]}>
+                查看全部 {localEntries.length} 首
+              </Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+
+      <View style={styles.section}>
+        <View style={styles.sectionHeader}>
           <Text style={[styles.sectionTitle, { color: colors.text }]}>功能入口</Text>
           <Text style={[styles.sectionSubtitle, { color: colors.textSecondary }]}>常用设置</Text>
         </View>
@@ -1073,6 +1421,13 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
             title="歌曲缓存"
             subtitle={cacheSummaryText}
             onPress={() => navigateToSubPage('cache')}
+            reducedMotion={reduceMotionEnabled}
+          />
+          <EntryCard
+            icon="folder-outline"
+            title="本地音乐"
+            subtitle={localImporting ? '导入中...' : localSummaryText}
+            onPress={() => navigateToSubPage('local')}
             reducedMotion={reduceMotionEnabled}
           />
           <EntryCard
@@ -1145,12 +1500,25 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
     </>
   ), [
     cacheSummaryText,
+    colors.accent,
+    colors.accentLight,
     colors.separator,
     colors.surface,
     colors.surfaceSecondary,
     colors.text,
     colors.textSecondary,
+    colors.textTertiary,
+    colors.warning,
+    currentTrackId,
     currentVersion,
+    deletingLocalIds,
+    handleDeleteLocalTrack,
+    handleImportLocalMusicFiles,
+    handlePlayLocalTrack,
+    localEntries,
+    localImporting,
+    localSummaryText,
+    navigateToSubPage,
     runtimeLogSummaryText,
     overviewItems,
     handleOpenFeedbackWebsite,
@@ -1370,6 +1738,148 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
     </>
   )
 
+  const renderLocalPage = () => (
+    <>
+      <View style={styles.section}>
+        <View style={styles.sectionHeader}>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>导入说明</Text>
+          <Text style={[styles.sectionSubtitle, { color: colors.textSecondary }]}>
+            {localStats.count} 首 · {formatCacheSize(localStats.sizeBytes)}
+          </Text>
+        </View>
+        <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.separator }]}>
+          <View style={styles.localHintWrap}>
+            <Text style={[styles.rowDesc, { color: colors.textSecondary }]}>
+              1. 文件名按「歌名-歌手」解析，例如「晴天-周杰伦.mp3」，横杠两边有没有空格都能识别{'\n'}
+              2. 文件会复制进 App，不占用「文件」App 里的原件，删除 App 数据会丢失{'\n'}
+              3. 搜索到同名歌曲时会自动命中本地文件播放，不再联网下载{'\n'}
+              4. 同名文件重复导入会覆盖旧文件
+            </Text>
+          </View>
+          {localStats.missingCount > 0 && (
+            <MotionPressable
+              onPress={() => void handlePruneMissingLocal()}
+              reducedMotion={reduceMotionEnabled}
+              style={styles.dangerAction}
+            >
+              <View style={styles.dangerActionInner}>
+                <Ionicons name="warning-outline" size={17} color={colors.warning} />
+                <Text style={[styles.dangerActionText, { color: colors.warning }]}>
+                  清理 {localStats.missingCount} 条失效记录
+                </Text>
+              </View>
+            </MotionPressable>
+          )}
+
+          <MotionPressable
+            onPress={handleImportLocalMusicFiles}
+            reducedMotion={reduceMotionEnabled}
+            disabled={localImporting}
+            style={styles.dangerAction}
+          >
+            <View style={styles.dangerActionInner}>
+              {localImporting
+                ? <ActivityIndicator size="small" color={colors.accent} />
+                : <Ionicons name="add-circle-outline" size={17} color={colors.accent} />}
+              <Text style={[styles.dangerActionText, { color: colors.accent }]}>
+                {localImporting ? '正在导入...' : '从文件导入歌曲'}
+              </Text>
+            </View>
+          </MotionPressable>
+        </View>
+      </View>
+
+      <View style={styles.section}>
+        <View style={styles.sectionHeader}>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>已导入歌曲</Text>
+          <Text style={[styles.sectionSubtitle, { color: colors.textSecondary }]}>
+            {localKeyword.trim()
+              ? `匹配 ${visibleLocalEntries.length} / ${localEntries.length} 首`
+              : `共 ${localEntries.length} 首`}
+          </Text>
+        </View>
+
+        <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.separator }]}>
+          <View style={[styles.cacheToolbar, { borderBottomColor: colors.separator }]}>
+            <View style={[styles.cacheSearchWrap, { backgroundColor: colors.surfaceSecondary }]}>
+              <Ionicons name="search-outline" size={14} color={colors.textTertiary} />
+              <TextInput
+                style={[styles.cacheSearchInput, { color: colors.text }]}
+                value={localKeyword}
+                onChangeText={setLocalKeyword}
+                placeholder="搜索歌名 / 歌手 / 文件名"
+                placeholderTextColor={colors.searchPlaceholder}
+                returnKeyType="search"
+                clearButtonMode="never"
+              />
+              {localKeyword.length > 0 && (
+                <TouchableOpacity
+                  onPress={() => setLocalKeyword('')}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  accessibilityLabel="清除搜索关键字"
+                >
+                  <Ionicons name="close-circle" size={15} color={colors.textTertiary} />
+                </TouchableOpacity>
+              )}
+            </View>
+
+            <MotionPressable
+              onPress={handleToggleLocalSort}
+              reducedMotion={reduceMotionEnabled}
+              style={[styles.cacheSortBtn, { backgroundColor: colors.surfaceSecondary }]}
+            >
+              <View style={styles.cacheSortBtnInner}>
+                <Ionicons
+                  name={localSortMode === 'size' ? 'resize-outline' : 'time-outline'}
+                  size={13}
+                  color={colors.textSecondary}
+                />
+                <Text style={[styles.cacheSortBtnText, { color: colors.textSecondary }]}>
+                  {localSortMode === 'size' ? '占用最大' : '最近导入'}
+                </Text>
+              </View>
+            </MotionPressable>
+          </View>
+
+          {visibleLocalEntries.length === 0 && (
+            <View style={styles.cacheEmptyWrap}>
+              <Ionicons name="folder-open-outline" size={22} color={colors.textTertiary} />
+              <Text style={[styles.cacheEmptyText, { color: colors.textSecondary }]}>
+                {localEntries.length === 0
+                  ? '还没有导入歌曲，点上方「从文件导入歌曲」开始'
+                  : '没有匹配的歌曲'}
+              </Text>
+            </View>
+          )}
+
+          {visibleLocalEntries.slice(0, LOCAL_LIST_RENDER_LIMIT).map((entry, index) => (
+            <LocalTrackRow
+              key={entry.id}
+              entry={entry}
+              colors={colors}
+              deleting={Boolean(deletingLocalIds[entry.id])}
+              isCurrentTrack={currentTrackId === entry.id}
+              reducedMotion={reduceMotionEnabled}
+              isLast={index === Math.min(visibleLocalEntries.length, LOCAL_LIST_RENDER_LIMIT) - 1}
+              onPlay={handlePlayLocalTrack}
+              onDelete={handleDeleteLocalTrack}
+            />
+          ))}
+
+          {visibleLocalEntries.length > LOCAL_LIST_RENDER_LIMIT && (
+            <View style={[styles.cacheMoreHint, { borderTopColor: colors.separator }]}>
+              <Text style={[styles.cacheMoreHintText, { color: colors.textTertiary }]}>
+                仅显示前 {LOCAL_LIST_RENDER_LIMIT} 条，可用上方搜索定位其他歌曲
+              </Text>
+            </View>
+          )}
+        </View>
+      </View>
+
+      <Text style={[styles.swipeHint, { color: colors.textTertiary }]}>从屏幕最左侧向右滑动可返回</Text>
+    </>
+  )
+
   const renderCachePage = () => (
     <>
       <View style={styles.section}>
@@ -1389,12 +1899,26 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
 
           <View style={styles.cacheStatsWrap}>
             <View style={[styles.cacheStatItem, { backgroundColor: colors.surfaceSecondary }]}>
-              <Text style={[styles.cacheStatLabel, { color: colors.textSecondary }]}>已缓存歌曲</Text>
+              <Text style={[styles.cacheStatLabel, { color: colors.textSecondary }]}>在线缓存</Text>
               <Text style={[styles.cacheStatValue, { color: colors.text }]}>{cacheFileCount} 首</Text>
             </View>
             <View style={[styles.cacheStatItem, { backgroundColor: colors.surfaceSecondary }]}>
-              <Text style={[styles.cacheStatLabel, { color: colors.textSecondary }]}>占用空间</Text>
+              <Text style={[styles.cacheStatLabel, { color: colors.textSecondary }]}>本地导入</Text>
+              <Text style={[styles.cacheStatValue, { color: colors.text }]}>{localStats.count} 首</Text>
+            </View>
+          </View>
+
+          <View style={[styles.cacheStatsWrap, styles.cacheStatsWrapTight]}>
+            <View style={[styles.cacheStatItem, { backgroundColor: colors.surfaceSecondary }]}>
+              <Text style={[styles.cacheStatLabel, { color: colors.textSecondary }]}>在线占用</Text>
               <Text style={[styles.cacheStatValue, { color: colors.text }]}>{formatCacheSize(cacheSizeBytes)}</Text>
+            </View>
+            <View style={[styles.cacheStatItem, { backgroundColor: colors.surfaceSecondary }]}>
+              <Text style={[styles.cacheStatLabel, { color: colors.textSecondary }]}>本地占用</Text>
+              <Text style={[styles.cacheStatValue, { color: colors.text }]}>
+                {formatCacheSize(localStats.sizeBytes)}
+                {localStats.missingCount ? ` · ${localStats.missingCount} 丢失` : ''}
+              </Text>
             </View>
           </View>
         </View>
@@ -1488,13 +2012,64 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
 
       <View style={styles.section}>
         <View style={styles.sectionHeader}>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>本地导入歌曲</Text>
+          <Text style={[styles.sectionSubtitle, { color: colors.textSecondary }]}>
+            {localStats.count ? `${localStats.count} 首 · ${formatCacheSize(localStats.sizeBytes)}` : '未导入'}
+          </Text>
+        </View>
+        <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.separator }]}>
+          <View style={[styles.dangerHintWrap, { borderBottomColor: colors.separator }]}>
+            <Text style={[styles.rowDesc, { color: colors.textSecondary }]}>
+              这些是你从「文件」导入的歌曲，不受「清空本地缓存」影响；删除会一并删掉 App 内的文件副本。
+            </Text>
+          </View>
+
+          {localEntries.length === 0 && (
+            <View style={styles.cacheEmptyWrap}>
+              <Ionicons name="folder-open-outline" size={22} color={colors.textTertiary} />
+              <Text style={[styles.cacheEmptyText, { color: colors.textSecondary }]}>
+                还没有导入歌曲，可在「我的 &gt; 本地音乐」中导入
+              </Text>
+            </View>
+          )}
+
+          {localEntries.slice(0, CACHE_LIST_RENDER_LIMIT).map((entry, index) => (
+            <LocalTrackRow
+              key={entry.id}
+              entry={entry}
+              colors={colors}
+              deleting={Boolean(deletingLocalIds[entry.id])}
+              isCurrentTrack={currentTrackId === entry.id}
+              reducedMotion={reduceMotionEnabled}
+              isLast={index === Math.min(localEntries.length, CACHE_LIST_RENDER_LIMIT) - 1}
+              onPlay={handlePlayLocalTrack}
+              onDelete={handleDeleteLocalTrack}
+            />
+          ))}
+
+          {localEntries.length > CACHE_LIST_RENDER_LIMIT && (
+            <TouchableOpacity
+              style={[styles.cacheMoreHint, { borderTopColor: colors.separator }]}
+              activeOpacity={0.6}
+              onPress={() => navigateToSubPage('local')}
+            >
+              <Text style={[styles.cacheMoreHintText, { color: colors.accent }]}>
+                查看全部 {localEntries.length} 首
+              </Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+
+      <View style={styles.section}>
+        <View style={styles.sectionHeader}>
           <Text style={[styles.sectionTitle, { color: colors.text }]}>批量清理</Text>
           <Text style={[styles.sectionSubtitle, { color: colors.textSecondary }]}>{cacheLoading ? '处理中...' : '危险操作'}</Text>
         </View>
         <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.separator }]}>
           <View style={[styles.dangerHintWrap, { borderBottomColor: colors.separator }]}>
             <Text style={[styles.rowDesc, { color: colors.textSecondary }]}>
-              单首删除请在上方列表操作；此处会一次性删除全部本地歌曲缓存。
+              单首删除请在上方列表操作；此处只删除在线缓存，从「文件」导入的本地歌曲不受影响。
             </Text>
           </View>
           <MotionPressable
@@ -1730,6 +2305,7 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
               {subPage === 'appearance' && renderAppearancePage()}
               {subPage === 'sources' && renderSourcesPage()}
               {subPage === 'cache' && renderCachePage()}
+              {subPage === 'local' && renderLocalPage()}
               {subPage === 'logs' && renderLogsPage()}
               {subPage === 'about' && renderAboutPage()}
             </ScrollView>
@@ -2121,6 +2697,9 @@ const styles = StyleSheet.create({
     fontSize: fontSize.caption2,
     marginBottom: 4,
   },
+  cacheStatsWrapTight: {
+    paddingTop: 0,
+  },
   cacheStatValue: {
     fontSize: fontSize.subhead,
     fontWeight: '700',
@@ -2207,6 +2786,28 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   cacheMoreHintText: { fontSize: fontSize.caption2, textAlign: 'center' },
+  localRowMain: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+  },
+  localRowTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+  },
+  localBadge: {
+    borderRadius: borderRadius.full,
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+  },
+  localBadgeText: { fontSize: 9, fontWeight: '700' },
+  localHintWrap: {
+    paddingHorizontal: spacing.md,
+    paddingTop: spacing.sm,
+    paddingBottom: spacing.xs,
+  },
   dangerHintWrap: {
     paddingHorizontal: spacing.md,
     paddingTop: spacing.sm,

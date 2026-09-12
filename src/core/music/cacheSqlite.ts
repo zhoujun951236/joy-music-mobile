@@ -5,6 +5,7 @@ const URL_CACHE_TABLE = 'music_url_cache'
 const LYRIC_CACHE_TABLE = 'music_lyric_cache'
 const AUDIO_SETTINGS_TABLE = 'audio_cache_settings'
 const AUDIO_INDEX_TABLE = 'audio_cache_index'
+const LOCAL_MUSIC_TABLE = 'local_music_index'
 
 let dbPromise: Promise<SQLite.SQLiteDatabase> | null = null
 
@@ -45,6 +46,17 @@ async function initializeDatabase(db: SQLite.SQLiteDatabase): Promise<void> {
       updated_at INTEGER NOT NULL,
       title TEXT,
       artist TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS ${LOCAL_MUSIC_TABLE} (
+      id TEXT PRIMARY KEY NOT NULL,
+      file_uri TEXT NOT NULL,
+      file_name TEXT NOT NULL,
+      title TEXT NOT NULL,
+      artist TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      format TEXT NOT NULL,
+      imported_at INTEGER NOT NULL
     );
   `)
 }
@@ -285,6 +297,112 @@ export async function replaceAudioCacheIndexRecords(
         record.updatedAt,
         record.title || null,
         record.artist || null
+      )
+    }
+    await db.execAsync('COMMIT')
+  } catch (error) {
+    await db.execAsync('ROLLBACK')
+    throw error
+  }
+}
+
+export interface LocalMusicRecord {
+  id: string
+  fileUri: string
+  fileName: string
+  title: string
+  artist: string
+  size: number
+  format: string
+  importedAt: number
+}
+
+interface LocalMusicRow {
+  id: string
+  file_uri: string
+  file_name: string
+  title: string
+  artist: string
+  size: number
+  format: string
+  imported_at: number
+}
+
+export async function loadLocalMusicRecords(): Promise<LocalMusicRecord[]> {
+  const db = await getDatabase()
+  const rows = await db.getAllAsync<LocalMusicRow>(
+    `
+      SELECT id, file_uri, file_name, title, artist, size, format, imported_at
+      FROM ${LOCAL_MUSIC_TABLE}
+      ORDER BY imported_at DESC
+    `
+  )
+  return rows.map((row) => ({
+    id: row.id,
+    fileUri: row.file_uri,
+    fileName: row.file_name,
+    title: row.title || '',
+    artist: row.artist || '',
+    size: Number(row.size || 0),
+    format: row.format || '',
+    importedAt: Number(row.imported_at || 0),
+  }))
+}
+
+export async function insertLocalMusicRecords(records: LocalMusicRecord[]): Promise<void> {
+  if (!records.length) return
+  const db = await getDatabase()
+  await db.execAsync('BEGIN IMMEDIATE TRANSACTION')
+  try {
+    for (const record of records) {
+      await db.runAsync(
+        `
+          INSERT OR REPLACE INTO ${LOCAL_MUSIC_TABLE}
+          (id, file_uri, file_name, title, artist, size, format, imported_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        record.id,
+        record.fileUri,
+        record.fileName,
+        record.title,
+        record.artist,
+        Number(record.size || 0),
+        record.format,
+        Number(record.importedAt || Date.now())
+      )
+    }
+    await db.execAsync('COMMIT')
+  } catch (error) {
+    await db.execAsync('ROLLBACK')
+    throw error
+  }
+}
+
+export async function deleteLocalMusicRecord(id: string): Promise<void> {
+  const db = await getDatabase()
+  await db.runAsync(`DELETE FROM ${LOCAL_MUSIC_TABLE} WHERE id = ?`, id)
+}
+
+export async function replaceLocalMusicRecords(records: LocalMusicRecord[]): Promise<void> {
+  const db = await getDatabase()
+  await db.execAsync('BEGIN IMMEDIATE TRANSACTION')
+  try {
+    await db.execAsync(`DELETE FROM ${LOCAL_MUSIC_TABLE}`)
+    for (const record of records) {
+      await db.runAsync(
+        `
+          INSERT INTO ${LOCAL_MUSIC_TABLE}
+          (id, file_uri, file_name, title, artist, size, format, imported_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        record.id,
+        record.fileUri,
+        record.fileName,
+        record.title,
+        record.artist,
+        Number(record.size || 0),
+        record.format,
+        Number(record.importedAt || Date.now())
       )
     }
     await db.execAsync('COMMIT')

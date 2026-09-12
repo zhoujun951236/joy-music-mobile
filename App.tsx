@@ -270,6 +270,8 @@ function AppContent() {
     const missingPlatforms = Array.from(
       new Set(
         tracks
+          // 本地导入的歌曲直接读 App 内文件，不依赖任何音源，跳过检查
+          .filter((track) => String(track.source || '').toLowerCase() !== 'local')
           .map((track) => String(track.source || 'kw').toLowerCase())
           .filter((platform) => !hasConfiguredJoySource(platform)),
       ),

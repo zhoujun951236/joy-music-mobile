@@ -41,6 +41,7 @@ export default React.memo(function TrackListItem({
   onMorePress,
 }: TrackListItemProps) {
   const { colors } = useTheme();
+  const isLocalTrack = String(track.source || '').toLowerCase() === 'local';
 
   return (
     <TouchableOpacity
@@ -89,15 +90,24 @@ export default React.memo(function TrackListItem({
 
       {/* Track info */}
       <View style={[styles.info, showIndex && styles.infoWithIndex]}>
-        <Text
-          style={[
-            styles.title,
-            { color: isCurrentTrack ? colors.accent : colors.text },
-          ]}
-          numberOfLines={1}
-        >
-          {track.title}
-        </Text>
+        <View style={styles.titleRow}>
+          <Text
+            style={[
+              styles.title,
+              { color: isCurrentTrack ? colors.accent : colors.text },
+            ]}
+            numberOfLines={1}
+          >
+            {track.title}
+          </Text>
+          {isLocalTrack && (
+            <View style={[styles.localBadge, { backgroundColor: colors.accentLight }]}>
+              <Text allowFontScaling={false} style={[styles.localBadgeText, { color: colors.accent }]}>
+                本地文件
+              </Text>
+            </View>
+          )}
+        </View>
         <Text
           style={[styles.artist, { color: colors.textSecondary }]}
           numberOfLines={1}
@@ -163,9 +173,24 @@ const styles = StyleSheet.create({
   infoWithIndex: {
     marginLeft: spacing.sm,
   },
+  titleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+  },
   title: {
+    flexShrink: 1,
     fontSize: fontSize.callout,
     fontWeight: '500',
+  },
+  localBadge: {
+    borderRadius: borderRadius.full,
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+  },
+  localBadgeText: {
+    fontSize: 9,
+    fontWeight: '700',
   },
   artist: {
     fontSize: fontSize.caption1,

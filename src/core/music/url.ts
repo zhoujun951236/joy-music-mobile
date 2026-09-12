@@ -6,6 +6,7 @@
 import { musicSourceManager, Quality } from './source'
 import { musicUrlCache } from './cache'
 import { audioFileCache } from './audioCache'
+import { inferLocalQuality, localMusicLibrary } from './localLibrary'
 import { normalizePlayableAudioUrl } from '../../utils/url'
 import {
   hasConfiguredJoySource,
@@ -206,6 +207,36 @@ export const getMusicUrl = async(request: MusicUrlRequest): Promise<MusicUrlResp
     const trackSource = inferTrackSource(musicId, musicInfo)
     // TX URL is usually short-lived, stale cache can easily fail playback.
     const shouldSkipCache = trackSource === 'tx'
+
+    // Step 0: 用户从"文件"导入的本地歌曲优先。
+    // 歌名 + 歌手一致就直接播本地文件，不联网下载；放在音源检查之前，
+    // 所以一个音源都没配也能播放已导入的歌。
+    // isRefresh（切音质重试 / 主动刷新）时跳过，给在线链路留一条降级路径。
+    if (!isRefresh) {
+      const localEntry = await localMusicLibrary.findMatch(
+        musicInfo?.title,
+        musicInfo?.artist
+      )
+      throwIfAborted(signal)
+      if (localEntry) {
+        const localQuality = inferLocalQuality(localEntry.format)
+        console.log(
+          `[LocalMusic] Hit imported file for "${musicInfo?.title}": ${localEntry.fileName}`
+        )
+        onProgress?.({
+          message: '已命中本地导入文件，正在加载本地文件...',
+          quality: localQuality,
+          attempt: 1,
+          totalAttempts: 1,
+        })
+        return {
+          url: localEntry.fileUri,
+          quality: localQuality,
+          musicId,
+          cacheHit: true,
+        }
+      }
+    }
 
     // Step 1: Get current source
     const source = musicSourceManager.getCurrentSource()
