@@ -65,7 +65,10 @@ jobs:
         run: npx expo prebuild --platform ios --clean --non-interactive
 
       - name: Install CocoaPods
-        run: bundle exec pod install --project-directory=ios
+        run: |
+          bundle update
+          bundle exec pod repo update
+          bundle exec pod install --project-directory=ios --repo-update --verbose
 
       - name: Build unsigned archive and package ipa
         shell: bash
