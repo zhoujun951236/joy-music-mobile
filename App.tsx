@@ -8,6 +8,7 @@ import {
   ActivityIndicator,
   Animated,
   Alert,
+  AppState,
   Easing,
   Linking,
   Platform,
@@ -38,6 +39,10 @@ import LibraryScreen from './src/screens/Library'
 import TrackListDetail from './src/screens/Detail/TrackListDetail'
 import NowPlaying from './src/screens/NowPlaying'
 import { playerController, type PlaybackStatus } from './src/core/player'
+import {
+  installRemoteCommandHandlers,
+  pushNowPlayingInfo,
+} from './src/core/player/remoteCommands'
 import { Playlist, Track, type TrackMoreActionContext } from './src/types/music'
 import { LeaderboardBoardItem, SongListItem } from './src/types/discover'
 import { getLeaderboardDetail, getSongListDetail } from './src/core/discover'
@@ -51,6 +56,11 @@ import {
   loadPlaylistSettings,
   savePlaylistSettings,
 } from './src/core/config/playlist'
+import {
+  loadPlayerSession,
+  savePlayerSession,
+  flushPlayerSession,
+} from './src/core/config/playerSession'
 import { applyJoyRuntimeConfig, hasConfiguredJoySource } from './src/core/music/sources/joy'
 import { emitScrollToTop, subscribeScrollTopState } from './src/core/ui/scrollToTopBus'
 import { installRuntimeLogger } from './src/core/logging/runtimeLogger'
@@ -157,6 +167,7 @@ function AppContent() {
   const themeMode = useSelector((state: RootState) => state.config.theme)
   const musicSourceState = useSelector((state: RootState) => state.musicSource)
   const playlistState = useSelector((state: RootState) => state.playlist)
+  const playerState = useSelector((state: RootState) => state.player)
   const insets = useSafeAreaInsets()
   const [activeTab, setActiveTab] = useState<TabName>('discover')
   const [detailView, setDetailView] = useState<DetailView | null>(null)
@@ -327,6 +338,26 @@ function AppContent() {
         }
 
         await playerController.initialize()
+
+        // 注册 iOS 锁屏/控制中心/蓝牙耳机远程控制处理器。
+        installRemoteCommandHandlers()
+
+        // 恢复上次的播放队列与当前歌曲（不自动播放）。
+        try {
+          const session = await loadPlayerSession()
+          if (active && session.playlist.length > 0) {
+            playerController.restoreSession({
+              playlist: session.playlist,
+              currentIndex: session.currentIndex,
+              repeatMode: session.repeatMode,
+              shuffleMode: session.shuffleMode,
+              positionMillis: session.positionMillis,
+            })
+          }
+        } catch (sessionError) {
+          console.warn('[App] Restore player session failed:', sessionError)
+        }
+
         const initialStatus = await playerController.getPlaybackStatus()
         if (active) syncPlayerStateToStore(initialStatus)
         unsubscribe = playerController.onStatusUpdate((status) => {
@@ -389,6 +420,51 @@ function AppContent() {
       currentPlaylistId: playlistState.currentPlaylistId,
     })
   }, [playlistHydrated, playlistState.currentPlaylistId, playlistState.playlists])
+
+  // 队列结构 / 当前歌曲 / 模式变化时持久化播放会话。
+  // 不订阅 currentTime 以免每 250ms 触发写入，那样会让 AsyncStorage 频繁 IO。
+  useEffect(() => {
+    const playlist = playerController.getPlaylist()
+    if (playlist.length === 0 && playerState.currentIndex < 0) return
+    savePlayerSession({
+      playlist,
+      currentIndex: playerController.getCurrentIndex(),
+      repeatMode: playerState.repeatMode,
+      shuffleMode: playerState.shuffleMode,
+      positionMillis: 0,
+    })
+  }, [
+    playerState.playlist,
+    playerState.currentIndex,
+    playerState.currentTrack?.id,
+    playerState.repeatMode,
+    playerState.shuffleMode,
+  ])
+
+  // 应用进入后台或被关闭前 flush 到 AsyncStorage。
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'background' || nextState === 'inactive') {
+        void flushPlayerSession()
+      }
+    })
+    return () => sub.remove()
+  }, [])
+
+  // 同步锁屏/控制中心展示的歌曲信息：仅在切歌、暂停/继续、duration 改变时刷新，
+  // 不依赖每 500ms 的 position 推送。
+  useEffect(() => {
+    pushNowPlayingInfo(
+      playerState.currentTrack,
+      playerState.currentTime,
+      playerState.duration,
+      playerState.isPlaying,
+    )
+  }, [
+    playerState.currentTrack?.id,
+    playerState.duration,
+    playerState.isPlaying,
+  ])
 
   useEffect(() => {
     // 启动后自动检查更新：仅在有新版本时提示，避免打扰。

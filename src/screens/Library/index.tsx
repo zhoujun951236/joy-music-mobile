@@ -16,6 +16,7 @@ import {
   NativeSyntheticEvent,
   Linking,
   Platform,
+  Pressable,
   Share,
   ScrollView,
   StyleProp,
@@ -44,6 +45,8 @@ import {
   ImportedMusicSource,
 } from '../../core/config/musicSource'
 import { audioFileCache, formatCacheSize } from '../../core/music/audioCache'
+import { playerController } from '../../core/player'
+import QueueSheet from '../NowPlaying/QueueSheet'
 import { emitScrollTopState, subscribeScrollToTop } from '../../core/ui/scrollToTopBus'
 import appConfig from '../../config'
 import { checkGithubReleaseUpdate } from '../../core/update/githubRelease'
@@ -229,6 +232,31 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
   ])
 
   const [subPage, setSubPage] = useState<LibrarySubPage>('main')
+  // 播放队列半屏：从"我的"页 overview 的"播放队列"格子打开。
+  const [queueSheetVisible, setQueueSheetVisible] = useState(false)
+  const queueSheetAnim = useRef(new Animated.Value(0)).current
+  const syncQueueSheetStore = useCallback(() => {
+    const snapshot = playerController.getPlayerState()
+    dispatch({
+      type: 'PLAYER_SYNC_STATE',
+      payload: {
+        ...snapshot,
+        playlist: playerController.getPlaylist(),
+        currentIndex: playerController.getCurrentIndex(),
+        currentTrack: playerController.getCurrentTrack(),
+      },
+    })
+  }, [dispatch])
+  const openQueueSheet = useCallback(() => {
+    setQueueSheetVisible(true)
+    queueSheetAnim.setValue(0)
+    Animated.spring(queueSheetAnim, {
+      toValue: 1,
+      useNativeDriver: true,
+      tension: 230,
+      friction: 24,
+    }).start()
+  }, [queueSheetAnim])
   const reportDetailVisibility = useCallback((visible: boolean) => {
     onDetailVisibilityChange?.(visible)
   }, [onDetailVisibilityChange])
@@ -654,10 +682,11 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
   }, [subPage, loadAudioCacheStats])
 
   useEffect(() => {
-    if (subPage !== 'main' && subPage !== 'cache') return
+    // 仅在缓存详情子页打开时定时刷新缓存大小，避免主页面后台轮询导致持续唤醒主线程。
+    if (subPage !== 'cache') return
     const timer = setInterval(() => {
       void loadAudioCacheStats(true)
-    }, 4000)
+    }, 6000)
     return () => clearInterval(timer)
   }, [loadAudioCacheStats, subPage])
 
@@ -772,15 +801,22 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
             {overviewItems.map((item, index) => {
               const showRightBorder = index % 2 === 0
               const showBottomBorder = index < 2
-              return (
-                <View
-                  key={item.key}
-                  style={[
-                    styles.overviewItem,
-                    showRightBorder ? { borderRightWidth: StyleSheet.hairlineWidth, borderRightColor: colors.separator } : null,
-                    showBottomBorder ? { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: colors.separator } : null,
-                  ]}
-                >
+              const onPressItem = item.key === 'queue' && queueCount > 0
+                ? openQueueSheet
+                : item.key === 'theme'
+                  ? () => navigateToSubPage('appearance')
+                  : item.key === 'source'
+                    ? () => navigateToSubPage('sources')
+                    : item.key === 'cache'
+                      ? () => navigateToSubPage('cache')
+                      : undefined
+              const itemStyle = [
+                styles.overviewItem,
+                showRightBorder ? { borderRightWidth: StyleSheet.hairlineWidth, borderRightColor: colors.separator } : null,
+                showBottomBorder ? { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: colors.separator } : null,
+              ]
+              const content = (
+                <>
                   <View style={styles.overviewTopRow}>
                     <View style={[styles.overviewIconWrap, { backgroundColor: colors.surfaceSecondary }]}>
                       <Ionicons name={item.icon} size={13} color={colors.textSecondary} />
@@ -790,6 +826,25 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
                   <Text style={[styles.overviewValue, { color: colors.text }]} numberOfLines={1}>
                     {item.value}
                   </Text>
+                </>
+              )
+              if (onPressItem) {
+                return (
+                  <Pressable
+                    key={item.key}
+                    style={({ pressed }) => [
+                      ...itemStyle,
+                      pressed ? { opacity: 0.6 } : null,
+                    ]}
+                    onPress={onPressItem}
+                  >
+                    {content}
+                  </Pressable>
+                )
+              }
+              return (
+                <View key={item.key} style={itemStyle}>
+                  {content}
                 </View>
               )
             })}
@@ -1486,6 +1541,15 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
           </View>
         </View>
         </Modal>
+
+        <QueueSheet
+          visible={queueSheetVisible}
+          renderTrack={playerState.currentTrack}
+          animValue={queueSheetAnim}
+          isPlaying={playerState.isPlaying}
+          onClose={() => setQueueSheetVisible(false)}
+          onSyncStore={syncQueueSheetStore}
+        />
       </View>
     </PanGestureHandler>
   )

@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>悦音签名工具</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif; max-width: 720px; margin: 32px auto; padding: 0 24px; color: #1a1a1a; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: #888; font-size: 13px; margin-bottom: 28px; }
+  .row { margin-bottom: 18px; }
+  label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+  input[type=text], input[type=password] { width: 100%; padding: 9px 11px; border: 1px solid #d0d0d0; border-radius: 6px; font-size: 14px; font-family: ui-monospace, Menlo, monospace; }
+  input[type=text]:focus, input[type=password]:focus { border-color: #1a8cde; outline: none; }
+  .filepicker {
+    border: 2px dashed #d0d0d0; border-radius: 8px; padding: 18px; text-align: center;
+    cursor: pointer; transition: all 0.15s; background: #fafafa;
+  }
+  .filepicker:hover { border-color: #1a8cde; background: #f0f7ff; }
+  .filepicker.has-file { border-style: solid; border-color: #4caf50; background: #f3faf3; text-align: left; }
+  .filepicker .icon { font-size: 18px; margin-right: 6px; }
+  .filepicker .name { font-family: ui-monospace, Menlo, monospace; font-size: 13px; word-break: break-all; }
+  .filepicker .meta { color: #888; font-size: 12px; margin-top: 4px; }
+  .filepicker input[type=file] { display: none; }
+  .info-box { background: #f7f7f7; border-radius: 8px; padding: 14px 16px; margin: 18px 0; font-size: 13px; }
+  .info-box .field { display: flex; justify-content: space-between; padding: 4px 0; }
+  .info-box .field span:first-child { color: #888; }
+  .info-box .field span:last-child { font-family: ui-monospace, Menlo, monospace; }
+  #sign-btn { width: 100%; padding: 13px; background: #1a8cde; color: white; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; margin-top: 12px; }
+  #sign-btn:hover { background: #1577be; }
+  #sign-btn:disabled { background: #b0c8df; cursor: not-allowed; }
+  #log { margin-top: 18px; background: #1a1a1a; color: #d4d4d4; border-radius: 8px; padding: 14px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.6; max-height: 320px; overflow-y: auto; white-space: pre-wrap; display: none; }
+  #log.show { display: block; }
+  .ok { color: #4caf50; }
+  .err { color: #ff6b6b; }
+  .out-dir { background: #fffaeb; border: 1px solid #f5d97a; border-radius: 6px; padding: 10px 12px; font-size: 12px; color: #7a5a00; margin-top: 10px; word-break: break-all; }
+</style>
+</head>
+<body>
+
+<h1>悦音签名工具</h1>
+<div class="sub">本地工具,文件只发到 127.0.0.1 上的本地服务,不外发。签好的 IPA 会自动下载到 ~/Downloads/,文件名 &lt;原名&gt;-signed.ipa。</div>
+
+<div class="row">
+  <label>IPA 文件</label>
+  <div class="filepicker" id="ipa-picker" onclick="document.getElementById('ipa-file').click()">
+    <span class="icon">📦</span><span class="hint">点击选择 .ipa 文件</span>
+    <input type="file" id="ipa-file" accept=".ipa">
+  </div>
+  <div class="out-dir" id="out-dir" style="display:none"></div>
+</div>
+
+<div id="info" class="info-box" style="display:none">
+  <div class="field"><span>App Name</span><span id="info-appName">-</span></div>
+  <div class="field"><span>Bundle ID</span><span id="info-bundleId">-</span></div>
+  <div class="field"><span>Version</span><span id="info-version">-</span></div>
+</div>
+
+<div class="row">
+  <label>App Name <span style="font-weight:400;color:#888">(可修改)</span></label>
+  <input type="text" id="appName" placeholder="选择 IPA 后自动填充">
+</div>
+
+<div class="row">
+  <label>Bundle ID <span style="font-weight:400;color:#888">(可修改)</span></label>
+  <input type="text" id="bundleId" placeholder="选择 IPA 后自动填充">
+</div>
+
+<div class="row">
+  <label>p12 证书</label>
+  <div class="filepicker" id="p12-picker" onclick="document.getElementById('p12-file').click()">
+    <span class="icon">🔑</span><span class="hint">点击选择 .p12 文件</span>
+    <input type="file" id="p12-file" accept=".p12">
+  </div>
+</div>
+
+<div class="row">
+  <label>p12 密码</label>
+  <input type="password" id="p12Password" placeholder="证书密码">
+</div>
+
+<div class="row">
+  <label>Mobile Provision</label>
+  <div class="filepicker" id="provision-picker" onclick="document.getElementById('provision-file').click()">
+    <span class="icon">📜</span><span class="hint">点击选择 .mobileprovision 文件</span>
+    <input type="file" id="provision-file" accept=".mobileprovision">
+  </div>
+</div>
+
+<div class="row">
+  <label>Entitlements <span style="font-weight:400;color:#888">(可选,不传用默认 joymusic.entitlements)</span></label>
+  <div class="filepicker" id="entitlements-picker" onclick="document.getElementById('entitlements-file').click()">
+    <span class="icon">🛡️</span><span class="hint">点击选择 .entitlements / .plist(可不选)</span>
+    <input type="file" id="entitlements-file" accept=".entitlements,.plist,.xml">
+  </div>
+</div>
+
+<button id="sign-btn" type="button" onclick="doSign()">签名</button>
+
+<div id="log"></div>
+
+<script>
+  const state = { ipa: null, p12: null, provision: null, entitlements: null, ipaName: null }
+
+  function fmtSize(bytes) {
+    if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
+    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB'
+    return bytes + ' B'
+  }
+
+  function bindPicker(role, fileInputId, pickerId, hintLabel) {
+    const input = document.getElementById(fileInputId)
+    const picker = document.getElementById(pickerId)
+    input.addEventListener('change', async() => {
+      const f = input.files[0]
+      if (!f) return
+      state[role] = f
+      picker.classList.add('has-file')
+      picker.innerHTML = `<span class="icon">✓</span><span class="name">${f.name}</span><div class="meta">${fmtSize(f.size)}</div>${input.outerHTML}`
+      // 重新绑定
+      const newInput = document.getElementById(fileInputId)
+      newInput.addEventListener('change', () => {})
+      if (role === 'ipa') {
+        state.ipaName = f.name
+        await inspectIpa(f)
+      }
+    })
+  }
+  bindPicker('ipa', 'ipa-file', 'ipa-picker', 'IPA')
+  bindPicker('p12', 'p12-file', 'p12-picker', 'p12')
+  bindPicker('provision', 'provision-file', 'provision-picker', 'mobileprovision')
+  bindPicker('entitlements', 'entitlements-file', 'entitlements-picker', 'entitlements')
+
+  async function inspectIpa(f) {
+    const fd = new FormData()
+    fd.append('ipa', f)
+    try {
+      const r = await fetch('/inspect', { method: 'POST', body: fd })
+      const data = await r.json()
+      if (data.error) throw new Error(data.error)
+      document.getElementById('info').style.display = 'block'
+      document.getElementById('info-appName').textContent = data.appName
+      document.getElementById('info-bundleId').textContent = data.bundleId
+      document.getElementById('info-version').textContent = data.version
+      document.getElementById('appName').value = data.appName
+      document.getElementById('bundleId').value = data.bundleId
+      const od = document.getElementById('out-dir')
+      od.style.display = 'block'
+      od.textContent = '签好后自动下载: ' + f.name.replace(/\.ipa$/i, '').replace(/-unsigned$/i, '') + '-signed.ipa'
+    } catch (err) {
+      alert('读取 IPA 失败: ' + err.message)
+    }
+  }
+
+  async function doSign() {
+    if (!state.ipa) { alert('请选择 IPA'); return }
+    if (!state.p12) { alert('请选择 p12'); return }
+    if (!state.provision) { alert('请选择 mobileprovision'); return }
+    const pwd = document.getElementById('p12Password').value
+    if (!pwd) { alert('请填 p12 密码'); return }
+
+    const btn = document.getElementById('sign-btn')
+    const log = document.getElementById('log')
+    btn.disabled = true
+    btn.textContent = '签名中...'
+    log.innerHTML = ''
+    log.classList.add('show')
+
+    const fd = new FormData()
+    fd.append('ipa', state.ipa)
+    fd.append('p12', state.p12)
+    fd.append('provision', state.provision)
+    if (state.entitlements) fd.append('entitlements', state.entitlements)
+    fd.append('p12Password', pwd)
+    fd.append('appName', document.getElementById('appName').value.trim())
+    fd.append('bundleId', document.getElementById('bundleId').value.trim())
+
+    try {
+      const r = await fetch('/sign', { method: 'POST', body: fd })
+      const reader = r.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n\n')
+        buf = lines.pop()
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const obj = JSON.parse(line.slice(6))
+          if (obj.log) log.textContent += obj.log + '\n'
+          if (obj.done) {
+            log.innerHTML += '\n<span class="ok">✓ 完成,正在下载: ' + obj.filename + '</span>\n'
+            const a = document.createElement('a')
+            a.href = obj.downloadUrl
+            a.download = obj.filename
+            document.body.appendChild(a)
+            a.click()
+            a.remove()
+          }
+          if (obj.error) log.innerHTML += '\n<span class="err">✗ 失败: ' + obj.error + '</span>\n'
+          log.scrollTop = log.scrollHeight
+        }
+      }
+    } catch (e) {
+      log.innerHTML += '\n<span class="err">✗ 网络错误: ' + e.message + '</span>\n'
+    } finally {
+      btn.disabled = false
+      btn.textContent = '签名'
+    }
+  }
+</script>
+</body>
+</html>
