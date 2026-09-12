@@ -843,6 +843,14 @@ function parseScriptRequestPlans(sourceConfig: ImportedMusicSource): RequestPlan
 function buildDefaultRequestPlans(): RequestPlan[] {
   return [
     {
+      method: 'GET',
+      pathTemplate: '/music/url?source={source}&songId={songId}&quality={quality}',
+    },
+    {
+      method: 'GET',
+      pathTemplate: '/music/url?source={source}&musicId={songId}&quality={quality}',
+    },
+    {
       method: 'POST',
       pathTemplate: '/music/url',
       bodyTemplate: {
