@@ -4,6 +4,7 @@
  * - 下次播放优先命中本地文件，避免再次走远端 API
  */
 
+import AsyncStorage from '@react-native-async-storage/async-storage'
 import * as FileSystem from 'expo-file-system/legacy'
 import { File as NativeFile } from 'expo-file-system'
 import { fetch as expoFetch } from 'expo/fetch'
@@ -157,19 +158,317 @@ async function downloadAudioByStreaming(url: string, targetUri: string): Promise
 }
 
 async function getCacheDir(): Promise<string> {
-  const baseDir = FileSystem.cacheDirectory || FileSystem.documentDirectory
+  // 历史版本曾使用 FileSystem.cacheDirectory（iOS Library/Caches/），
+  // 该目录在覆盖安装、系统空间紧张时会被 iOS 清空，导致下载好的歌曲全部丢失。
+  // 现改用 documentDirectory（iOS Documents/），覆盖安装会保留，符合"长期缓存"的诉求。
+  const baseDir = FileSystem.documentDirectory || FileSystem.cacheDirectory
   if (!baseDir) {
     throw new Error('FileSystem directory unavailable')
   }
   return `${baseDir}${AUDIO_CACHE_DIR_NAME}/`
 }
 
+function getLegacyCacheDir(): string | null {
+  const baseDir = FileSystem.cacheDirectory
+  if (!baseDir) return null
+  return `${baseDir}${AUDIO_CACHE_DIR_NAME}/`
+}
+
+const MIGRATION_FLAG_KEY = '@joy_audio_cache_migrated_v1'
+
+/**
+ * 一次性迁移：把 Library/Caches/joy_audio_cache/ 里残存的歌曲挪到 Documents/joy_audio_cache/，
+ * 同时把 SQLite 索引中 fileUri 的旧前缀替换为新前缀，让"覆盖升级"过来的用户保留已下载的歌。
+ *
+ * 触发时机：每次启动时调用一次（内部用 AsyncStorage flag 保证只跑一次）。
+ * 兼容情况：
+ *   - 旧目录不存在（全新装 / iOS 已清掉）→ 直接打 flag 跳过
+ *   - 索引中 fileUri 还指向旧路径 → 把前缀替换；如果新位置已经存在同名文件就跳过这条索引
+ *   - 旧目录里的孤儿文件（不在索引里）→ 直接搬过去，不影响主流程
+ */
+/**
+ * 从索引 entry 的旧 fileUri 中提取文件名部分（如 "kw_61997_1781595560865_0.mp3"）。
+ * 兼容 iOS 沙盒 UUID 变化的情况：路径的前缀（含 UUID）每次重启可能变，但文件名稳定。
+ */
+function extractLegacyFileName(legacyUri: string): string | null {
+  if (!legacyUri) return null
+  const match = legacyUri.match(/\/joy_audio_cache\/([^/]+)$/)
+  return match?.[1] ?? null
+}
+
+async function migrateLegacyCacheIfNeeded(
+  loadIndex: () => Promise<Record<string, CachedAudioFileEntry>>,
+  saveIndex: (next: Record<string, CachedAudioFileEntry>) => Promise<void>,
+): Promise<void> {
+  try {
+    const done = await AsyncStorage.getItem(MIGRATION_FLAG_KEY)
+    if (done === '1') {
+      // 即便 flag 已打，每次启动也要做两件事：
+      // 1. UUID 漂移修复：iOS 沙盒每次启动 UUID 都变，索引里的 fileUri 前缀失效，
+      //    必须按"文件名 + 当前 newDir"重建路径。这是覆盖装/重启后第一次播放卡死的根因。
+      // 2. 自愈：扫新目录里索引没记录的孤儿文件按文件名反向补条目。
+      await rewriteIndexUriForCurrentSandbox(loadIndex, saveIndex)
+      await selfHealOrphanFiles(loadIndex, saveIndex)
+      return
+    }
+
+    const legacyDir = getLegacyCacheDir()
+    const newDir = await getCacheDir()
+    if (!legacyDir || legacyDir === newDir) {
+      await AsyncStorage.setItem(MIGRATION_FLAG_KEY, '1')
+      return
+    }
+
+    const legacyInfo = await FileSystem.getInfoAsync(legacyDir)
+    const legacyExists = legacyInfo.exists
+
+    // 准备目标目录。
+    const newInfo = await FileSystem.getInfoAsync(newDir)
+    if (!newInfo.exists) {
+      await FileSystem.makeDirectoryAsync(newDir, { intermediates: true })
+    }
+
+    // —— Step 1：搬物理文件 ——
+    let movedFileCount = 0
+    if (legacyExists) {
+      try {
+        const fileNames = await FileSystem.readDirectoryAsync(legacyDir)
+        for (const name of fileNames) {
+          const fromUri = `${legacyDir}${name}`
+          const toUri = `${newDir}${name}`
+          try {
+            const toInfo = await FileSystem.getInfoAsync(toUri)
+            if (toInfo.exists) {
+              await FileSystem.deleteAsync(fromUri, { idempotent: true })
+              continue
+            }
+            await FileSystem.moveAsync({ from: fromUri, to: toUri })
+            movedFileCount += 1
+          } catch (moveError) {
+            console.warn('[AudioCache] migrate move failed:', name, moveError)
+          }
+        }
+      } catch (listError) {
+        console.warn('[AudioCache] migrate listing legacy dir failed:', listError)
+      }
+    }
+
+    // —— Step 2：修补索引 fileUri（含 UUID 漂移修复） ——
+    await rewriteIndexUriForCurrentSandbox(loadIndex, saveIndex)
+
+    // —— Step 3：扫 newDir 里"实际存在但索引里没记录"的孤儿文件，按文件名反向重建 ——
+    await selfHealOrphanFiles(loadIndex, saveIndex)
+
+    // —— Step 4：清空旧目录残留 ——
+    if (legacyExists) {
+      try {
+        await FileSystem.deleteAsync(legacyDir, { idempotent: true })
+      } catch {
+        // ignore
+      }
+    }
+
+    console.log(
+      `[AudioCache] Migrated legacy cache: movedFiles=${movedFileCount}, indexPatched=${indexPatchedCount}, indexDropped=${indexDroppedCount}`
+    )
+    await AsyncStorage.setItem(MIGRATION_FLAG_KEY, '1')
+  } catch (error) {
+    console.warn('[AudioCache] migrateLegacyCacheIfNeeded failed:', error)
+    // 不打 flag，下次启动还能重试。
+  }
+}
+
+/**
+ * 把索引里所有 fileUri 都改写成"当前 newDir + 文件名"。
+ *
+ * 触发原因：iOS 沙盒 UUID 每次启动可能变（覆盖安装、设备重启、Replace Container 都会触发），
+ * 索引里写入时的 fileUri 包含的 UUID 在新启动后已经失效。如果不修，下次播放走 cache 命中
+ * 时返回旧 UUID 的路径，expo-audio 加载这个不存在的文件会卡很久才报错（用户感觉是"加载中"），
+ * 然后 getCachedEntry 才把这条索引清掉。
+ *
+ * 策略：
+ * - fileUri 已经在 newDir 下 → 跳过（同一次启动内已修过 / 本次新写入的）
+ * - fileUri 能提取出 joy_audio_cache/<fileName> → 拼成 newDir + fileName
+ *   - 新位置文件存在 → 改写 entry.fileUri
+ *   - 新位置文件不存在 → 删掉这条索引（下次播放走在线兜底）
+ */
+async function rewriteIndexUriForCurrentSandbox(
+  loadIndex: () => Promise<Record<string, CachedAudioFileEntry>>,
+  saveIndex: (next: Record<string, CachedAudioFileEntry>) => Promise<void>,
+): Promise<void> {
+  try {
+    const newDir = await getCacheDir()
+    const index = await loadIndex()
+    let patched = 0
+    let dropped = 0
+    let dirty = false
+
+    for (const key of Object.keys(index)) {
+      const entry = index[key]
+      if (!entry?.fileUri) continue
+      if (entry.fileUri.startsWith(newDir)) continue
+
+      const fileName = extractLegacyFileName(entry.fileUri)
+      if (!fileName) continue
+
+      const nextUri = `${newDir}${fileName}`
+      const nextInfo = await FileSystem.getInfoAsync(nextUri)
+      if (!nextInfo.exists) {
+        delete index[key]
+        dropped += 1
+        dirty = true
+        continue
+      }
+      index[key] = { ...entry, fileUri: nextUri }
+      patched += 1
+      dirty = true
+    }
+
+    if (dirty) {
+      await saveIndex(index)
+      console.log(`[AudioCache] Rewrite index uri for current sandbox: patched=${patched}, dropped=${dropped}`)
+    }
+  } catch (error) {
+    console.warn('[AudioCache] rewriteIndexUriForCurrentSandbox failed:', error)
+  }
+}
+
+/**
+ * 索引自愈：扫 documents/joy_audio_cache/ 下所有文件，对索引里没记录的，
+ * 按文件名反向解析出 musicId/source 重建一条 minimal entry。
+ *
+ * 文件名格式：`<safeFileName(musicId)>_<timestamp>_<candidateIndex>.<ext>`
+ * - 例如 `kw_61997_1781595560865_0.mp3` → musicId="kw_61997", source="kw"
+ * - source 用 musicId 第一段（kw/wy/tx/kg）猜；猜不到默认 unknown
+ * - quality 不知道，先填 '320k'（绝大多数缓存都是这）；title/artist 留空
+ * - 一旦该歌再次走 cacheFromUrl 流程，会被真值覆盖
+ *
+ * 此函数无副作用前提：只为索引里没的文件加条目，不动已有条目。
+ */
+async function selfHealOrphanFiles(
+  loadIndex: () => Promise<Record<string, CachedAudioFileEntry>>,
+  saveIndex: (next: Record<string, CachedAudioFileEntry>) => Promise<void>,
+): Promise<void> {
+  try {
+    const newDir = await getCacheDir()
+    const newInfo = await FileSystem.getInfoAsync(newDir)
+    if (!newInfo.exists) return
+
+    const fileNames = await FileSystem.readDirectoryAsync(newDir)
+    if (!fileNames.length) return
+
+    const index = await loadIndex()
+    const knownFileUris = new Set(
+      Object.values(index)
+        .map((e) => e?.fileUri || '')
+        .filter(Boolean),
+    )
+
+    let healedCount = 0
+    let dirty = false
+    for (const name of fileNames) {
+      const fileUri = `${newDir}${name}`
+      if (knownFileUris.has(fileUri)) continue
+
+      // 反向解析：去掉扩展名，按 _ 切，最后两段是 timestamp / candidateIndex，前面拼回去就是 musicId。
+      const lastDot = name.lastIndexOf('.')
+      const stem = lastDot > 0 ? name.slice(0, lastDot) : name
+      const parts = stem.split('_')
+      if (parts.length < 3) continue
+      // candidateIndex (parts[last]) 必须是数字，timestamp (parts[last-1]) 必须是 13 位左右纯数字。
+      const candidateIdxStr = parts[parts.length - 1]
+      const tsStr = parts[parts.length - 2]
+      if (!/^\d+$/.test(candidateIdxStr)) continue
+      if (!/^\d{10,16}$/.test(tsStr)) continue
+      const musicIdParts = parts.slice(0, parts.length - 2)
+      if (!musicIdParts.length) continue
+      const musicId = musicIdParts.join('_')
+      // 已有索引 entry，且仍指向现存文件 → 跳过（防覆盖正常索引）。
+      // 已有但 entry 指向已不存在的文件（比如 UUID 漂移没修干净的残留）→ 让自愈用当前
+      // 真实存在的 fileUri 覆盖。
+      const existing = index[musicId]
+      if (existing?.fileUri) {
+        const existingInfo = await FileSystem.getInfoAsync(existing.fileUri)
+        if (existingInfo.exists) continue
+      }
+
+      const sourceGuess = musicIdParts[0] || 'unknown'
+
+      const info = await FileSystem.getInfoAsync(fileUri)
+      const size = info.exists && typeof info.size === 'number' ? info.size : 0
+
+      index[musicId] = {
+        musicId,
+        fileUri,
+        quality: '320k' as Quality,
+        source: sourceGuess,
+        size,
+        updatedAt: Date.now(),
+        title: undefined,
+        artist: undefined,
+      }
+      healedCount += 1
+      dirty = true
+    }
+
+    if (dirty) {
+      await saveIndex(index)
+      console.log(`[AudioCache] Self-healed orphan files: ${healedCount}`)
+    }
+  } catch (error) {
+    console.warn('[AudioCache] selfHealOrphanFiles failed:', error)
+  }
+}
+
 class AudioFileCacheManager {
   private settingsCache: AudioCacheSettings | null = null
   private indexCache: Record<string, CachedAudioFileEntry> | null = null
   private inFlightTasks = new Map<string, Promise<void>>()
+  private migrationPromise: Promise<void> | null = null
+
+  private async ensureMigrated(): Promise<void> {
+    if (!this.migrationPromise) {
+      // 直接走 SQL 层而不是 this.readIndex，避免在迁移过程中读到/写入到 indexCache。
+      const loadIndex = async(): Promise<Record<string, CachedAudioFileEntry>> => {
+        const records = await loadAudioCacheIndexRecords()
+        const map: Record<string, CachedAudioFileEntry> = {}
+        records.forEach((record) => {
+          if (!record.fileUri) return
+          map[record.musicId] = {
+            musicId: record.musicId,
+            fileUri: record.fileUri,
+            quality: record.quality as Quality,
+            source: record.source,
+            updatedAt: Number(record.updatedAt || Date.now()),
+            size: Number(record.size || 0),
+            title: record.title,
+            artist: record.artist,
+          }
+        })
+        return map
+      }
+      const saveIndex = async(next: Record<string, CachedAudioFileEntry>): Promise<void> => {
+        const records: AudioCacheIndexRecord[] = Object.values(next).map((entry) => ({
+          musicId: entry.musicId,
+          fileUri: entry.fileUri,
+          quality: entry.quality,
+          source: entry.source,
+          size: Number(entry.size || 0),
+          updatedAt: Number(entry.updatedAt || Date.now()),
+          title: entry.title,
+          artist: entry.artist,
+        }))
+        await replaceAudioCacheIndexRecords(records)
+        // 让上层重读最新索引。
+        this.indexCache = null
+      }
+      this.migrationPromise = migrateLegacyCacheIfNeeded(loadIndex, saveIndex)
+    }
+    await this.migrationPromise
+  }
 
   private async ensureDir(): Promise<string> {
+    await this.ensureMigrated()
     const dir = await getCacheDir()
     const info = await FileSystem.getInfoAsync(dir)
     if (!info.exists) {
@@ -203,6 +502,7 @@ class AudioFileCacheManager {
 
   private async readIndex(): Promise<Record<string, CachedAudioFileEntry>> {
     if (this.indexCache) return this.indexCache
+    await this.ensureMigrated()
     try {
       const normalized: Record<string, CachedAudioFileEntry> = {}
       const records = await loadAudioCacheIndexRecords()

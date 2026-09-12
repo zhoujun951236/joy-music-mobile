@@ -1,9 +1,16 @@
 /**
  * 底部 Mini 播放条。
  * 横向布局：封面 + 歌名/作者 + 中间歌词 + 播放控制，底部可拖动进度条。
+ *
+ * 性能拆分：
+ * - 外壳（BlurView/LinearGradient 等高代价视觉层）只依赖 track + isPlaying，
+ *   切歌或暂停/继续时才重渲染。
+ * - 高频更新（进度条 + 当前歌词行）单独以 LyricTicker / SeekBar 两个独立子组件
+ *   订阅 playerController 的 onStatusUpdate，setState 仅作用于自身，
+ *   避免外壳每 500ms 一次 reconciliation。
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   View,
   TouchableOpacity,
@@ -18,10 +25,12 @@ import Slider from '@react-native-community/slider'
 import { Ionicons } from '@expo/vector-icons'
 import { BlurView } from 'expo-blur'
 import { LinearGradient } from 'expo-linear-gradient'
+import { useSelector } from 'react-redux'
 import { useTheme, MINI_PLAYER_HEIGHT, fontSize } from '../../theme'
-import { usePlayerStatus } from '../../hooks/usePlayerStatus'
+import { usePlayerTrack } from '../../hooks/usePlayerStatus'
 import { playerController } from '../../core/player'
 import { getLyric, findCurrentLineIndex, type LyricLine } from '../../core/lyric'
+import type { RootState } from '../../store'
 
 interface MiniPlayerProps {
   onOpenPlayer?: () => void
@@ -34,6 +43,200 @@ const SEEK_TOUCH_HEIGHT = 18
 
 const clamp01 = (value: number): number => Math.min(Math.max(value, 0), 1)
 
+interface LyricTickerProps {
+  lyricLines: LyricLine[]
+  lyricLoading: boolean
+  accentColor: string
+  textSecondaryColor: string
+}
+
+/** 歌词行 — 仅订阅 position，500ms 内部 setState，不重绘外壳。 */
+const LyricTicker = memo(function LyricTicker({
+  lyricLines,
+  lyricLoading,
+  accentColor,
+  textSecondaryColor,
+}: LyricTickerProps) {
+  const [position, setPosition] = useState(0)
+
+  useEffect(() => {
+    let active = true
+    void playerController.getPlaybackStatus().then((status) => {
+      if (active && status) setPosition(status.positionMillis)
+    })
+    const unsubscribe = playerController.onStatusUpdate((status) => {
+      if (active) setPosition(status.positionMillis)
+    })
+    return () => {
+      active = false
+      unsubscribe()
+    }
+  }, [])
+
+  const currentLyricIndex = findCurrentLineIndex(lyricLines, position)
+  const currentLyricText = !lyricLines.length
+    ? (lyricLoading ? '歌词加载中...' : '暂无歌词')
+    : (currentLyricIndex < 0
+      ? (lyricLines[0]?.text || '暂无歌词')
+      : (lyricLines[currentLyricIndex]?.text || '暂无歌词'))
+  const hasActiveLyric = lyricLines.length > 0 && currentLyricIndex >= 0
+
+  return (
+    <View style={styles.lyricWrap}>
+      <Text
+        numberOfLines={1}
+        style={[
+          styles.lyricText,
+          { color: hasActiveLyric ? accentColor : textSecondaryColor },
+        ]}
+      >
+        {currentLyricText}
+      </Text>
+    </View>
+  )
+})
+
+interface SeekBarProps {
+  trackKey: string
+  isDark: boolean
+  accentColor: string
+}
+
+/** 进度条 — 自订阅 position/duration，与外壳解耦。 */
+const SeekBar = memo(function SeekBar({
+  trackKey,
+  isDark,
+  accentColor,
+}: SeekBarProps) {
+  const [duration, setDuration] = useState(0)
+  const [progress, setProgress] = useState(0)
+  const [isSeeking, setIsSeeking] = useState(false)
+  const [seekProgress, setSeekProgress] = useState(0)
+  const [seekBarWidth, setSeekBarWidth] = useState(0)
+  const isSeekingRef = useRef(false)
+
+  useEffect(() => {
+    let active = true
+    void playerController.getPlaybackStatus().then((status) => {
+      if (!active || !status) return
+      setDuration(status.durationMillis)
+      setProgress(status.durationMillis > 0
+        ? status.positionMillis / status.durationMillis
+        : 0)
+    })
+    const unsubscribe = playerController.onStatusUpdate((status) => {
+      if (!active) return
+      setDuration(status.durationMillis)
+      if (!isSeekingRef.current) {
+        setProgress(status.durationMillis > 0
+          ? status.positionMillis / status.durationMillis
+          : 0)
+      }
+    })
+    return () => {
+      active = false
+      unsubscribe()
+    }
+  }, [])
+
+  useEffect(() => {
+    isSeekingRef.current = false
+    setIsSeeking(false)
+    setSeekProgress(0)
+  }, [trackKey])
+
+  const handleSeekLayout = useCallback((event: LayoutChangeEvent) => {
+    setSeekBarWidth(event.nativeEvent.layout.width)
+  }, [])
+
+  const handleSeekStart = useCallback((value: number) => {
+    const nextProgress = clamp01(value)
+    isSeekingRef.current = true
+    setIsSeeking(true)
+    setSeekProgress(nextProgress)
+  }, [])
+
+  const handleSeekChange = useCallback((value: number) => {
+    setSeekProgress(clamp01(value))
+  }, [])
+
+  const handleSeekComplete = useCallback((value: number) => {
+    const nextProgress = clamp01(value)
+    setSeekProgress(nextProgress)
+    isSeekingRef.current = false
+    setIsSeeking(false)
+    if (duration > 0) {
+      void playerController.seek(Math.floor(duration * nextProgress))
+    }
+  }, [duration])
+
+  const activeProgress = isSeeking ? seekProgress : clamp01(progress)
+  const thumbSize = isSeeking ? 10 : 8
+  const trackTop = (SEEK_TOUCH_HEIGHT - SEEK_TRACK_HEIGHT) / 2
+  const thumbTop = trackTop + (SEEK_TRACK_HEIGHT - thumbSize) / 2
+  const thumbOffset = seekBarWidth > 0
+    ? Math.max(
+      0,
+      Math.min(
+        seekBarWidth - thumbSize,
+        activeProgress * seekBarWidth - thumbSize / 2
+      )
+    )
+    : 0
+
+  return (
+    <View style={styles.seekWrap}>
+      <View style={styles.seekTouchArea} onLayout={handleSeekLayout}>
+        <View
+          style={[
+            styles.seekTrack,
+            { backgroundColor: isDark ? 'rgba(255, 255, 255, 0.12)' : 'rgba(0, 0, 0, 0.08)' },
+          ]}
+        />
+        <View
+          style={[
+            styles.seekFill,
+            {
+              backgroundColor: accentColor,
+              width: `${activeProgress * 100}%`,
+            },
+          ]}
+        />
+        <View
+          pointerEvents="none"
+          style={[
+            styles.seekThumb,
+            {
+              width: thumbSize,
+              height: thumbSize,
+              borderRadius: thumbSize / 2,
+              left: thumbOffset,
+              top: thumbTop,
+              backgroundColor: '#FFFFFF',
+              borderColor: 'rgba(0,0,0,0.1)',
+              opacity: isSeeking ? 1 : 0.9,
+              transform: [{ scale: isSeeking ? 1.06 : 1 }],
+            },
+          ]}
+        />
+        <Slider
+          style={styles.seekNativeSlider}
+          minimumValue={0}
+          maximumValue={1}
+          step={0}
+          value={activeProgress}
+          onSlidingStart={handleSeekStart}
+          onValueChange={handleSeekChange}
+          onSlidingComplete={handleSeekComplete}
+          minimumTrackTintColor="transparent"
+          maximumTrackTintColor="transparent"
+          thumbTintColor="transparent"
+        />
+      </View>
+    </View>
+  )
+})
+
 /**
  * 渲染底部条形 Mini 播放器。
  * 融合沉浸式液态玻璃质感的设计。
@@ -41,14 +244,15 @@ const clamp01 = (value: number): number => Math.min(Math.max(value, 0), 1)
  */
 export default function MiniPlayer({ onOpenPlayer }: MiniPlayerProps) {
   const { colors, isDark } = useTheme()
-  const { isPlaying, currentTrack, progress, position, duration } = usePlayerStatus()
+  // 优先用 Redux 里的 currentTrack —— 启动时 restoreSession 会把 controller 状态同步到 Redux，
+  // 所以即便没开始播放，只要队列里有歌，Mini 播放栏就能持续显示，不会因为没 status 推送而消失。
+  const reduxCurrentTrack = useSelector((state: RootState) => state.player.currentTrack)
+  const { isPlaying, currentTrack: liveCurrentTrack } = usePlayerTrack()
+  const currentTrack = liveCurrentTrack || reduxCurrentTrack
 
   const entryAnim = useRef(new Animated.Value(currentTrack ? 1 : 0)).current
   const [lyricLines, setLyricLines] = useState<LyricLine[]>([])
   const [lyricLoading, setLyricLoading] = useState(false)
-  const [seekBarWidth, setSeekBarWidth] = useState(0)
-  const [isSeeking, setIsSeeking] = useState(false)
-  const [seekProgress, setSeekProgress] = useState(0)
   const lyricTrackKey = currentTrack
     ? `${currentTrack.source || 'kw'}_${currentTrack.songmid || currentTrack.id}`
     : ''
@@ -92,17 +296,6 @@ export default function MiniPlayer({ onOpenPlayer }: MiniPlayerProps) {
     }
   }, [lyricTrackKey])
 
-  useEffect(() => {
-    if (!isSeeking) {
-      setSeekProgress(clamp01(progress))
-    }
-  }, [progress, isSeeking])
-
-  useEffect(() => {
-    setIsSeeking(false)
-    setSeekProgress(0)
-  }, [lyricTrackKey])
-
   const handleOpen = useCallback(() => {
     onOpenPlayer?.()
   }, [onOpenPlayer])
@@ -119,58 +312,14 @@ export default function MiniPlayer({ onOpenPlayer }: MiniPlayerProps) {
     }
   }, [isPlaying])
 
-  const commitSeek = useCallback((nextProgress: number) => {
-    if (duration > 0) {
-      void playerController.seek(Math.floor(duration * nextProgress))
-    }
-  }, [duration])
-
-  const handleSeekLayout = useCallback((event: LayoutChangeEvent) => {
-    setSeekBarWidth(event.nativeEvent.layout.width)
-  }, [])
-
-  const handleSeekStart = useCallback((value: number) => {
-    const nextProgress = clamp01(value)
-    setIsSeeking(true)
-    setSeekProgress(nextProgress)
-  }, [])
-
-  const handleSeekChange = useCallback((value: number) => {
-    setSeekProgress(clamp01(value))
-  }, [])
-
-  const handleSeekComplete = useCallback((value: number) => {
-    const nextProgress = clamp01(value)
-    setSeekProgress(nextProgress)
-    setIsSeeking(false)
-    commitSeek(nextProgress)
-  }, [commitSeek])
+  const artistInfo = useMemo(() => {
+    if (!currentTrack) return ''
+    return currentTrack.source
+      ? `${currentTrack.artist} · ${currentTrack.source.toUpperCase()}`
+      : currentTrack.artist
+  }, [currentTrack])
 
   if (!currentTrack) return null
-
-  const artistInfo = currentTrack.source
-    ? `${currentTrack.artist} · ${currentTrack.source.toUpperCase()}`
-    : currentTrack.artist
-  const currentLyricIndex = findCurrentLineIndex(lyricLines, position)
-  const currentLyricText = !lyricLines.length
-    ? (lyricLoading ? '歌词加载中...' : '暂无歌词')
-    : (currentLyricIndex < 0
-      ? (lyricLines[0]?.text || '暂无歌词')
-      : (lyricLines[currentLyricIndex]?.text || '暂无歌词'))
-  const hasActiveLyric = lyricLines.length > 0 && currentLyricIndex >= 0
-  const activeProgress = isSeeking ? seekProgress : clamp01(progress)
-  const thumbSize = isSeeking ? 10 : 8
-  const trackTop = (SEEK_TOUCH_HEIGHT - SEEK_TRACK_HEIGHT) / 2
-  const thumbTop = trackTop + (SEEK_TRACK_HEIGHT - thumbSize) / 2
-  const thumbOffset = seekBarWidth > 0
-    ? Math.max(
-      0,
-      Math.min(
-        seekBarWidth - thumbSize,
-        activeProgress * seekBarWidth - thumbSize / 2
-      )
-    )
-    : 0
 
   return (
     <Animated.View
@@ -255,17 +404,12 @@ export default function MiniPlayer({ onOpenPlayer }: MiniPlayerProps) {
                   {artistInfo}
                 </Text>
               </View>
-              <View style={styles.lyricWrap}>
-                <Text
-                  numberOfLines={1}
-                  style={[
-                    styles.lyricText,
-                    { color: hasActiveLyric ? colors.accent : colors.textSecondary },
-                  ]}
-                >
-                  {currentLyricText}
-                </Text>
-              </View>
+              <LyricTicker
+                lyricLines={lyricLines}
+                lyricLoading={lyricLoading}
+                accentColor={colors.accent}
+                textSecondaryColor={colors.textSecondary}
+              />
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -286,59 +430,11 @@ export default function MiniPlayer({ onOpenPlayer }: MiniPlayerProps) {
             </TouchableOpacity>
           </View>
 
-          {/* —— 进度条 —— */}
-          <View style={styles.seekWrap}>
-            <View
-              style={styles.seekTouchArea}
-              onLayout={handleSeekLayout}
-            >
-              <View
-                style={[
-                  styles.seekTrack,
-                  { backgroundColor: isDark ? 'rgba(255, 255, 255, 0.12)' : 'rgba(0, 0, 0, 0.08)' },
-                ]}
-              />
-              <View
-                style={[
-                  styles.seekFill,
-                  {
-                    backgroundColor: colors.accent,
-                    width: `${activeProgress * 100}%`,
-                  },
-                ]}
-              />
-              <View
-                pointerEvents="none"
-                style={[
-                  styles.seekThumb,
-                  {
-                    width: thumbSize,
-                    height: thumbSize,
-                    borderRadius: thumbSize / 2,
-                    left: thumbOffset,
-                    top: thumbTop,
-                    backgroundColor: '#FFFFFF',
-                    borderColor: 'rgba(0,0,0,0.1)', // 把原来的颜色拿掉，换成白色本体带微边框即可
-                    opacity: isSeeking ? 1 : 0.9,
-                    transform: [{ scale: isSeeking ? 1.06 : 1 }],
-                  },
-                ]}
-              />
-              <Slider
-                style={styles.seekNativeSlider}
-                minimumValue={0}
-                maximumValue={1}
-                step={0}
-                value={activeProgress}
-                onSlidingStart={handleSeekStart}
-                onValueChange={handleSeekChange}
-                onSlidingComplete={handleSeekComplete}
-                minimumTrackTintColor="transparent"
-                maximumTrackTintColor="transparent"
-                thumbTintColor="transparent"
-              />
-            </View>
-          </View>
+          <SeekBar
+            trackKey={lyricTrackKey}
+            isDark={isDark}
+            accentColor={colors.accent}
+          />
         </View>
       </View>
     </Animated.View>
@@ -378,13 +474,13 @@ const styles = StyleSheet.create({
   innerBorder: {
     ...StyleSheet.absoluteFillObject,
     borderRadius: 20,
-    borderWidth: 1, // 粗一点点更能体现高光发亮
+    borderWidth: 1,
   },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
     flex: 1,
-    zIndex: 1, // 确保在玻璃层上方
+    zIndex: 1,
   },
   mainArea: {
     flex: 1,
@@ -431,7 +527,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
   },
   lyricText: {
-    fontSize: fontSize.caption1 - 1, // 让歌词显得更精致一点
+    fontSize: fontSize.caption1 - 1,
     fontWeight: '600',
     textAlign: 'center',
   },
@@ -447,7 +543,7 @@ const styles = StyleSheet.create({
     left: 10,
     right: 10,
     bottom: -6,
-    zIndex: 2, // 保证能盖住圆角背景
+    zIndex: 2,
   },
   seekTouchArea: {
     height: SEEK_TOUCH_HEIGHT,

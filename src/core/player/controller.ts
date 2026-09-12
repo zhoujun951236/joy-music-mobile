@@ -473,9 +473,23 @@ class MusicPlayerController {
 
   /**
    * Resume playback
+   *
+   * 关键场景：杀掉应用重新打开后，restoreSession 装回了 currentTrack/playlist 但没有创建
+   * expo-audio 的 player 实例。此时直接调底层 resume() 会因为 this.player===null 静默失败，
+   * 表现为"mini 栏点播放/锁屏点播放都没反应"。这里检测到这种"冷状态"时主动 playTrack()
+   * 一次，让链路从解析 URL → 创建 player → 开始播放走通。
    */
   async resume(): Promise<void> {
     try {
+      const status = await expoAVPlayer.getStatus()
+      if (!status?.isLoaded && this.currentTrack) {
+        console.log('[PlayerController] resume() with cold engine, kicking playTrack()')
+        await this.playTrack(this.currentTrack, {
+          autoPlay: true,
+          quality: this.preferredQuality,
+        })
+        return
+      }
       await expoAVPlayer.resume()
       this.isPlaying = true
       console.log('[PlayerController] Resumed')
@@ -681,6 +695,35 @@ class MusicPlayerController {
     this.currentIndex = playlist.length ? 0 : -1
     this.currentTrack = playlist.length ? playlist[0] : null
     console.log(`[PlayerController] Playlist set with ${playlist.length} tracks`)
+  }
+
+  /**
+   * 从持久化快照中恢复队列与上次播放歌曲，但不自动播放音频。
+   * 仅设置内存状态，让 UI 展示出上次的播放列表与当前曲目。
+   */
+  restoreSession(snapshot: {
+    playlist: Track[]
+    currentIndex: number
+    repeatMode?: PlayerState['repeatMode']
+    shuffleMode?: boolean
+    positionMillis?: number
+  }): void {
+    if (!snapshot || !Array.isArray(snapshot.playlist) || snapshot.playlist.length === 0) {
+      return
+    }
+    const safeIndex = Math.min(
+      Math.max(0, snapshot.currentIndex || 0),
+      snapshot.playlist.length - 1,
+    )
+    this.playlist = [...snapshot.playlist]
+    this.currentIndex = safeIndex
+    this.currentTrack = this.playlist[safeIndex] || null
+    if (snapshot.repeatMode) this.repeatMode = snapshot.repeatMode
+    if (typeof snapshot.shuffleMode === 'boolean') this.shuffleMode = snapshot.shuffleMode
+    this.currentTimeMillis = Math.max(0, snapshot.positionMillis || 0)
+    this.durationMillis = 0
+    this.isPlaying = false
+    console.log(`[PlayerController] Session restored: ${this.playlist.length} tracks, index=${safeIndex}`)
   }
 
   /**

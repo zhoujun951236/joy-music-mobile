@@ -4,7 +4,7 @@
  */
 
 import { AudioPlayer, createAudioPlayer, setAudioModeAsync } from 'expo-audio'
-import { Platform } from 'react-native'
+import { AppState, type AppStateStatus, Platform } from 'react-native'
 import { Track } from '../../types/music'
 
 export interface PlayerConfig {
@@ -29,6 +29,12 @@ class ExpoAudioPlayerWrapper {
   private currentTrack: Track | null = null
   private statusUpdateCallback: ((status: PlaybackStatus) => void) | null = null
   private statusSubscription: { remove: () => void } | null = null
+  private appStateSubscription: { remove: () => void } | null = null
+  // 后台节流：息屏 / App 进入后台时只放过结构变化的事件（isPlaying/duration/didJustFinish），
+  // 高频 position-only 推送会被丢弃，避免 JS 线程被 250-500ms 一次的回调持续唤醒导致发热。
+  private isInBackground = false
+  private lastEmittedIsPlaying = false
+  private lastEmittedDurationMillis = 0
 
   async initialize(): Promise<void> {
     if (this.isInitialized) return
@@ -38,17 +44,36 @@ class ExpoAudioPlayerWrapper {
       interruptionMode: 'doNotMix',
       shouldRouteThroughEarpiece: false,
     })
+    this.installAppStateListener()
     this.isInitialized = true
     console.log('[ExpoAudioPlayer] Initialized')
+  }
+
+  private installAppStateListener(): void {
+    if (this.appStateSubscription) return
+    this.isInBackground = AppState.currentState !== 'active'
+    this.appStateSubscription = AppState.addEventListener('change', (next: AppStateStatus) => {
+      const wasBackground = this.isInBackground
+      this.isInBackground = next !== 'active'
+      // 回到前台时主动推送一次最新状态，让 UI 立即同步进度。
+      if (wasBackground && !this.isInBackground) {
+        const player = this.player
+        if (player) {
+          this.handlePlaybackStatusUpdate(player.currentStatus)
+        }
+      }
+    })
   }
 
   async play(track: Track, url: string, config?: PlayerConfig): Promise<void> {
     if (!this.isInitialized) await this.initialize()
 
     if (!this.player) {
+      // updateInterval 决定状态回调频率，500ms 已足够 UI 进度平滑，
+      // 同时减半 JS<->Native 桥接调用以降低 CPU 占用与发热。
       this.player = createAudioPlayer(
         { uri: url },
-        { updateInterval: 250, keepAudioSessionActive: true }
+        { updateInterval: 500, keepAudioSessionActive: true }
       )
       this.statusSubscription = this.player.addListener('playbackStatusUpdate', (status) => {
         this.handlePlaybackStatusUpdate(status)
@@ -139,6 +164,18 @@ class ExpoAudioPlayerWrapper {
       rate: status?.playbackRate ?? 1,
       volume: this.player?.volume ?? 1,
     }
+
+    // 后台时仅放过"结构变化"事件：isPlaying / duration 改变 / 自然播完。
+    // 纯 position 变化（息屏听歌的常态）不再唤醒 JS 链路。
+    if (this.isInBackground) {
+      const structuralChange = payload.didJustFinish
+        || payload.isPlaying !== this.lastEmittedIsPlaying
+        || payload.durationMillis !== this.lastEmittedDurationMillis
+      if (!structuralChange) return
+    }
+
+    this.lastEmittedIsPlaying = payload.isPlaying
+    this.lastEmittedDurationMillis = payload.durationMillis
     this.statusUpdateCallback?.(payload)
   }
 

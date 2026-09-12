@@ -21,6 +21,10 @@ import {
   View,
 } from 'react-native'
 import { PanGestureHandler } from 'react-native-gesture-handler'
+import DraggableFlatList, {
+  RenderItemParams,
+  ScaleDecorator,
+} from 'react-native-draggable-flatlist'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useDispatch, useSelector } from 'react-redux'
 import { Ionicons } from '@expo/vector-icons'
@@ -886,60 +890,139 @@ export default function PlaylistScreen({ onTrackPress, onTrackMorePress, onPlayA
     )
   }, [detailSortMode])
 
-  const renderDetailTrackItem = useCallback(({ item, index }: { item: Track; index: number }) => {
+  // 是否允许进入"拖动排序模式"：默认排序 + 没在搜索时才允许；其它情况下当前看到的顺序与
+  // playlist.tracks 实际顺序不一致，拖动会引起歧义，禁用入口。
+  const isReorderEnabled = detailSortMode === 'default' && !normalizedDetailSearchKeyword
+
+  // ── 排序模式（与 QueueSheet 同款：进入 → 拖动 reorderDraft → 完成/取消）──
+  const [isReorderMode, setIsReorderMode] = useState(false)
+  const [reorderDraft, setReorderDraft] = useState<Track[]>([])
+
+  const enterReorderMode = useCallback(() => {
+    if (!selectedPlaylist || !isReorderEnabled) return
+    setReorderDraft(selectedPlaylist.tracks.slice())
+    setIsReorderMode(true)
+  }, [isReorderEnabled, selectedPlaylist])
+
+  const cancelReorderMode = useCallback(() => {
+    setIsReorderMode(false)
+    setReorderDraft([])
+  }, [])
+
+  const commitReorderMode = useCallback(() => {
+    if (!selectedPlaylist) {
+      setIsReorderMode(false)
+      setReorderDraft([])
+      return
+    }
+    dispatch({
+      type: 'PLAYLIST_UPDATE',
+      payload: {
+        ...selectedPlaylist,
+        tracks: reorderDraft.slice(),
+        updatedAt: Date.now(),
+      },
+    })
+    setIsReorderMode(false)
+    setReorderDraft([])
+  }, [dispatch, reorderDraft, selectedPlaylist])
+
+  /** 拖拽过程：仅更新 reorderDraft，不动 store */
+  const handleDetailDragEnd = useCallback(({ data: nextData }: { data: Track[]; from: number; to: number }) => {
+    setReorderDraft(nextData)
+  }, [])
+
+  // 退出歌单详情时若仍在排序模式 → 自动放弃
+  useEffect(() => {
+    if (!selectedPlaylist && isReorderMode) {
+      setIsReorderMode(false)
+      setReorderDraft([])
+    }
+  }, [isReorderMode, selectedPlaylist])
+
+  const renderDetailTrackItem = useCallback(({ item, getIndex, drag, isActive }: RenderItemParams<Track>) => {
+    const idx = getIndex?.() ?? 0
     const isCurrent = currentTrackId === item.id
     const rowCover = normalizeImageUrl(item.coverUrl || item.picUrl, 500)
     return (
-      <Pressable
-        style={({ pressed }) => [
-          styles.detailTrackRow,
-          {
-            backgroundColor: isCurrent
-              ? (isDark ? 'rgba(255,191,104,0.16)' : 'rgba(201,128,41,0.12)')
-              : 'transparent',
-            opacity: pressed ? 0.88 : 1,
-          },
-        ]}
-        onPress={() => onTrackPress?.(item)}
-      >
-        <View style={styles.detailTrackIndex}>
-          {isCurrent
-            ? <Ionicons name={isPlaying ? 'volume-high' : 'pause'} size={16} color={colors.accent} />
-            : <Text style={[styles.detailTrackIndexText, { color: colors.textTertiary }]}>{index + 1}</Text>}
-        </View>
-        <View style={[styles.detailTrackCover, { backgroundColor: colors.surfaceSecondary }]}>
-          {rowCover
-            ? <Image source={{ uri: rowCover, cache: 'force-cache' }} style={styles.detailTrackCoverImage} resizeMode="cover" fadeDuration={0} />
-            : <Ionicons name="musical-note" size={15} color={colors.textTertiary} />}
-        </View>
-        <View style={styles.detailTrackInfo}>
-          <Text
-            numberOfLines={1}
-            style={[
-              styles.detailTrackTitle,
-              { color: isCurrent ? colors.accent : colors.text },
-            ]}
-          >
-            {item.title || '未知歌曲'}
-          </Text>
-          <Text numberOfLines={1} style={[styles.detailTrackMeta, { color: colors.textSecondary }]}>
-            {item.artist || '未知歌手'}
-            {item.album ? ` · ${item.album}` : ''}
-          </Text>
-        </View>
+      <ScaleDecorator>
         <Pressable
-          style={styles.detailTrackMore}
-          hitSlop={8}
-          onPress={(event) => {
-            event.stopPropagation?.()
-            onTrackMorePress?.(item, { playlistId: selectedPlaylistId || undefined })
+          style={({ pressed }) => [
+            styles.detailTrackRow,
+            {
+              backgroundColor: isActive
+                ? (isDark ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.08)')
+                : isCurrent
+                  ? (isDark ? 'rgba(255,191,104,0.16)' : 'rgba(201,128,41,0.12)')
+                  : 'transparent',
+              opacity: pressed && !isActive ? 0.88 : 1,
+              ...(isActive && Platform.OS === 'ios' ? {
+                shadowColor: '#000',
+                shadowOffset: { width: 0, height: 6 },
+                shadowOpacity: 0.22,
+                shadowRadius: 10,
+              } : null),
+            },
+          ]}
+          onPress={() => {
+            if (isActive) return
+            if (isReorderMode) return // 排序模式下不响应短按播放
+            onTrackPress?.(item)
           }}
+          // 仅排序模式启用整行长按拖动；默认态长按无效，避免误触
+          onLongPress={isReorderMode ? drag : undefined}
+          delayLongPress={200}
         >
-          <Ionicons name="ellipsis-vertical" size={16} color={colors.textTertiary} />
+          <View style={styles.detailTrackIndex}>
+            {isCurrent
+              ? <Ionicons name={isPlaying ? 'volume-high' : 'pause'} size={16} color={colors.accent} />
+              : <Text style={[styles.detailTrackIndexText, { color: colors.textTertiary }]}>{idx + 1}</Text>}
+          </View>
+          <View style={[styles.detailTrackCover, { backgroundColor: colors.surfaceSecondary }]}>
+            {rowCover
+              ? <Image source={{ uri: rowCover, cache: 'force-cache' }} style={styles.detailTrackCoverImage} resizeMode="cover" fadeDuration={0} />
+              : <Ionicons name="musical-note" size={15} color={colors.textTertiary} />}
+          </View>
+          <View style={styles.detailTrackInfo}>
+            <Text
+              numberOfLines={1}
+              style={[
+                styles.detailTrackTitle,
+                { color: isCurrent ? colors.accent : colors.text },
+              ]}
+            >
+              {item.title || '未知歌曲'}
+            </Text>
+            <Text numberOfLines={1} style={[styles.detailTrackMeta, { color: colors.textSecondary }]}>
+              {item.artist || '未知歌手'}
+              {item.album ? ` · ${item.album}` : ''}
+            </Text>
+          </View>
+          {isReorderMode ? (
+            <Pressable
+              style={styles.detailTrackDragHandle}
+              hitSlop={8}
+              onLongPress={drag}
+              delayLongPress={120}
+            >
+              <Ionicons name="reorder-three" size={22} color={colors.textSecondary} />
+            </Pressable>
+          ) : (
+            <Pressable
+              style={styles.detailTrackMore}
+              hitSlop={8}
+              onPress={(event) => {
+                event.stopPropagation?.()
+                onTrackMorePress?.(item, { playlistId: selectedPlaylistId || undefined })
+              }}
+            >
+              <Ionicons name="ellipsis-vertical" size={16} color={colors.textTertiary} />
+            </Pressable>
+          )}
         </Pressable>
-      </Pressable>
+      </ScaleDecorator>
     )
-  }, [colors.accent, colors.surfaceSecondary, colors.text, colors.textSecondary, colors.textTertiary, currentTrackId, isDark, isPlaying, onTrackMorePress, onTrackPress, selectedPlaylistId])
+  }, [colors.accent, colors.surfaceSecondary, colors.text, colors.textSecondary, colors.textTertiary, currentTrackId, isDark, isPlaying, isReorderMode, onTrackMorePress, onTrackPress, selectedPlaylistId])
 
   const renderPlaylistCard = useCallback(({ item }: { item: Playlist }) => {
     const isCurrent = item.id === currentPlaylistId
@@ -1115,6 +1198,7 @@ export default function PlaylistScreen({ onTrackPress, onTrackMorePress, onPlayA
         failOffsetY={panGesture.failOffsetY}
         onGestureEvent={panGesture.onGestureEvent}
         onHandlerStateChange={panGesture.onHandlerStateChange}
+        enabled={!isReorderMode}
       >
         <Animated.View
           style={[
@@ -1125,12 +1209,13 @@ export default function PlaylistScreen({ onTrackPress, onTrackMorePress, onPlayA
             },
           ]}
         >
-          <FlatList
-            ref={detailListRef}
+          <DraggableFlatList
+            ref={detailListRef as any}
             onScroll={handleDetailListScroll}
             scrollEventThrottle={16}
-            data={detailVisibleTracks}
-            keyExtractor={(item, index) => `${item.id}_${index}`}
+            data={isReorderMode ? reorderDraft : detailVisibleTracks}
+            // keyExtractor 必须 stable（不拼 index），详见 QueueSheet 的注释
+            keyExtractor={(item) => item.id}
             onEndReachedThreshold={0.35}
             onEndReached={handleLoadMoreDetailTracks}
             initialNumToRender={18}
@@ -1138,6 +1223,9 @@ export default function PlaylistScreen({ onTrackPress, onTrackMorePress, onPlayA
             windowSize={9}
             removeClippedSubviews={Platform.OS === 'android'}
             updateCellsBatchingPeriod={40}
+            onDragEnd={handleDetailDragEnd}
+            activationDistance={isReorderEnabled ? 8 : 9999}
+            autoscrollThreshold={48}
             ListHeaderComponent={(
               <>
                 <LinearGradient
@@ -1250,6 +1338,18 @@ export default function PlaylistScreen({ onTrackPress, onTrackMorePress, onPlayA
                   >
                     <Ionicons name="reorder-three-outline" size={20} color={colors.textSecondary} />
                   </Pressable>
+                  <Pressable
+                    style={({ pressed }) => [
+                      styles.detailToolBtn,
+                      {
+                        opacity: pressed ? 0.82 : (isReorderEnabled ? 1 : 0.4),
+                      },
+                    ]}
+                    disabled={!isReorderEnabled}
+                    onPress={enterReorderMode}
+                  >
+                    <Ionicons name="swap-vertical-outline" size={20} color={colors.textSecondary} />
+                  </Pressable>
                 </View>
               </View>
 
@@ -1309,6 +1409,43 @@ export default function PlaylistScreen({ onTrackPress, onTrackMorePress, onPlayA
             contentContainerStyle={{ paddingBottom: BOTTOM_INSET + spacing.lg }}
             renderItem={renderDetailTrackItem}
           />
+          {isReorderMode && (
+            <View
+              style={[
+                styles.detailReorderBar,
+                {
+                  paddingTop: insets.top + spacing.sm,
+                  backgroundColor: isDark ? 'rgba(0,0,0,0.78)' : 'rgba(255,255,255,0.96)',
+                  borderBottomColor: colors.separator,
+                },
+              ]}
+            >
+              <Text style={[styles.detailReorderTitle, { color: colors.text }]}>排序模式</Text>
+              <View style={styles.detailReorderActions}>
+                <Pressable
+                  style={[
+                    styles.detailReorderBtn,
+                    {
+                      borderColor: colors.separator,
+                      backgroundColor: isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.04)',
+                    },
+                  ]}
+                  onPress={cancelReorderMode}
+                >
+                  <Text style={[styles.detailReorderBtnText, { color: colors.textSecondary }]}>取消</Text>
+                </Pressable>
+                <Pressable
+                  style={[
+                    styles.detailReorderBtn,
+                    { borderColor: colors.accent, backgroundColor: colors.accent },
+                  ]}
+                  onPress={commitReorderMode}
+                >
+                  <Text style={[styles.detailReorderBtnText, { color: '#FFFFFF' }]}>完成</Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
         </Animated.View>
       </PanGestureHandler>
     )
@@ -1984,6 +2121,46 @@ const styles = StyleSheet.create({
     borderRadius: 17,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  detailTrackDragHandle: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  detailReorderBar: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
+    paddingBottom: spacing.sm,
+    paddingHorizontal: spacing.md,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    zIndex: 50,
+  },
+  detailReorderTitle: {
+    fontSize: fontSize.callout,
+    fontWeight: '700',
+  },
+  detailReorderActions: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  detailReorderBtn: {
+    paddingHorizontal: 14,
+    height: 30,
+    borderRadius: 15,
+    borderWidth: StyleSheet.hairlineWidth,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  detailReorderBtnText: {
+    fontSize: fontSize.caption1,
+    fontWeight: '600',
   },
   modalMask: {
     flex: 1,
