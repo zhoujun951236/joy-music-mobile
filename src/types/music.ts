@@ -16,6 +16,8 @@ export interface Track {
   copyrightId?: string
   hash?: string
   picUrl?: string
+  /** 从「文件」导入的本地歌曲：播放走本地文件，UI 上显示「本地文件」标识 */
+  isLocalFile?: boolean
 }
 
 export interface Playlist {

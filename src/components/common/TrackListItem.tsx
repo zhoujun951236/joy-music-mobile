@@ -41,7 +41,8 @@ export default React.memo(function TrackListItem({
   onMorePress,
 }: TrackListItemProps) {
   const { colors } = useTheme();
-  const isLocalTrack = String(track.source || '').toLowerCase() === 'local';
+  const isLocalTrack =
+    track.isLocalFile === true || String(track.source || '').toLowerCase() === 'local';
 
   return (
     <TouchableOpacity

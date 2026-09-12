@@ -9,6 +9,27 @@ const LOCAL_MUSIC_TABLE = 'local_music_index'
 
 let dbPromise: Promise<SQLite.SQLiteDatabase> | null = null
 
+/**
+ * 给已存在的表补列：CREATE TABLE IF NOT EXISTS 对老库不会加新列，
+ * 所以逐列 PRAGMA 检查后 ALTER TABLE，兼容已经导入过歌曲的旧安装。
+ */
+async function ensureColumns(
+  db: SQLite.SQLiteDatabase,
+  table: string,
+  columns: Array<[string, string]>
+): Promise<void> {
+  try {
+    const rows = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`)
+    const existing = new Set(rows.map((row) => row.name))
+    for (const [name, type] of columns) {
+      if (existing.has(name)) continue
+      await db.execAsync(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`)
+    }
+  } catch (error) {
+    console.warn(`[CacheSqlite] ensureColumns failed for ${table}:`, error)
+  }
+}
+
 async function initializeDatabase(db: SQLite.SQLiteDatabase): Promise<void> {
   await db.execAsync(`
     PRAGMA journal_mode = WAL;
@@ -56,9 +77,21 @@ async function initializeDatabase(db: SQLite.SQLiteDatabase): Promise<void> {
       artist TEXT NOT NULL,
       size INTEGER NOT NULL,
       format TEXT NOT NULL,
-      imported_at INTEGER NOT NULL
+      imported_at INTEGER NOT NULL,
+      cover_url TEXT,
+      online_id TEXT,
+      online_source TEXT,
+      songmid TEXT
     );
   `)
+
+  // 老版本已经建过 local_music_index 的，用 ALTER 补上新列
+  await ensureColumns(db, LOCAL_MUSIC_TABLE, [
+    ['cover_url', 'TEXT'],
+    ['online_id', 'TEXT'],
+    ['online_source', 'TEXT'],
+    ['songmid', 'TEXT'],
+  ])
 }
 
 async function getDatabase(): Promise<SQLite.SQLiteDatabase> {
@@ -315,6 +348,10 @@ export interface LocalMusicRecord {
   size: number
   format: string
   importedAt: number
+  coverUrl?: string
+  onlineId?: string
+  onlineSource?: string
+  songmid?: string
 }
 
 interface LocalMusicRow {
@@ -326,13 +363,39 @@ interface LocalMusicRow {
   size: number
   format: string
   imported_at: number
+  cover_url: string | null
+  online_id: string | null
+  online_source: string | null
+  songmid: string | null
+}
+
+const LOCAL_MUSIC_COLUMNS =
+  'id, file_uri, file_name, title, artist, size, format, imported_at, cover_url, online_id, online_source, songmid'
+
+const LOCAL_MUSIC_PLACEHOLDERS = '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+
+function localMusicValues(record: LocalMusicRecord): Array<string | number | null> {
+  return [
+    record.id,
+    record.fileUri,
+    record.fileName,
+    record.title,
+    record.artist,
+    Number(record.size || 0),
+    record.format,
+    Number(record.importedAt || Date.now()),
+    record.coverUrl || null,
+    record.onlineId || null,
+    record.onlineSource || null,
+    record.songmid || null,
+  ]
 }
 
 export async function loadLocalMusicRecords(): Promise<LocalMusicRecord[]> {
   const db = await getDatabase()
   const rows = await db.getAllAsync<LocalMusicRow>(
     `
-      SELECT id, file_uri, file_name, title, artist, size, format, imported_at
+      SELECT ${LOCAL_MUSIC_COLUMNS}
       FROM ${LOCAL_MUSIC_TABLE}
       ORDER BY imported_at DESC
     `
@@ -346,6 +409,10 @@ export async function loadLocalMusicRecords(): Promise<LocalMusicRecord[]> {
     size: Number(row.size || 0),
     format: row.format || '',
     importedAt: Number(row.imported_at || 0),
+    coverUrl: row.cover_url || undefined,
+    onlineId: row.online_id || undefined,
+    onlineSource: row.online_source || undefined,
+    songmid: row.songmid || undefined,
   }))
 }
 
@@ -358,17 +425,10 @@ export async function insertLocalMusicRecords(records: LocalMusicRecord[]): Prom
       await db.runAsync(
         `
           INSERT OR REPLACE INTO ${LOCAL_MUSIC_TABLE}
-          (id, file_uri, file_name, title, artist, size, format, imported_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          (${LOCAL_MUSIC_COLUMNS})
+          VALUES ${LOCAL_MUSIC_PLACEHOLDERS}
         `,
-        record.id,
-        record.fileUri,
-        record.fileName,
-        record.title,
-        record.artist,
-        Number(record.size || 0),
-        record.format,
-        Number(record.importedAt || Date.now())
+        ...localMusicValues(record)
       )
     }
     await db.execAsync('COMMIT')
@@ -392,17 +452,10 @@ export async function replaceLocalMusicRecords(records: LocalMusicRecord[]): Pro
       await db.runAsync(
         `
           INSERT INTO ${LOCAL_MUSIC_TABLE}
-          (id, file_uri, file_name, title, artist, size, format, imported_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          (${LOCAL_MUSIC_COLUMNS})
+          VALUES ${LOCAL_MUSIC_PLACEHOLDERS}
         `,
-        record.id,
-        record.fileUri,
-        record.fileName,
-        record.title,
-        record.artist,
-        Number(record.size || 0),
-        record.format,
-        Number(record.importedAt || Date.now())
+        ...localMusicValues(record)
       )
     }
     await db.execAsync('COMMIT')

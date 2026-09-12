@@ -51,6 +51,7 @@ import {
   type LocalMusicEntry,
   type LocalMusicStats,
 } from '../../core/music/localLibrary'
+import { enrichLocalEntries } from '../../core/music/localEnrich'
 import { playerController } from '../../core/player'
 import QueueSheet from '../NowPlaying/QueueSheet'
 import { emitScrollTopState, subscribeScrollToTop } from '../../core/ui/scrollToTopBus'
@@ -150,6 +151,13 @@ const QUALITY_LABELS: Record<Quality, string> = {
   master: '超清母带 (Master)',
 }
 
+function getLogLevelColor(level: RuntimeLogEntry['level'], colors: ThemeColors): string {
+  if (level === 'error') return colors.danger
+  if (level === 'warn') return '#E68A00'
+  if (level === 'info') return colors.accent
+  return colors.textSecondary
+}
+
 function formatDateTime(timestamp: number | null): string {
   if (!timestamp) return '--'
   const date = new Date(timestamp)
@@ -167,7 +175,7 @@ type CacheSortMode = 'recent' | 'size'
 const CACHE_LIST_RENDER_LIMIT = 200
 
 /** 主页"本地音乐"只预览前几首，其余进"管理全部" */
-const MAIN_LOCAL_PREVIEW_COUNT = 6
+const MAIN_LOCAL_PREVIEW_COUNT = 5
 
 /** 本地音乐子页最多渲染的条数 */
 const LOCAL_LIST_RENDER_LIMIT = 300
@@ -205,15 +213,28 @@ function buildCacheEntriesSignature(entries: CachedAudioFileEntry[]): string {
   return entries.map((entry) => `${entry.musicId}:${entry.size}:${entry.updatedAt}`).join('|')
 }
 
-/** 本地导入文件转成播放用 Track：source 固定 local，用于全 App 的"本地文件"标识 */
+/** 播放用 Track 的 id：补全过在线信息后用在线 id，方便歌词/封面按平台取 */
+function localEntryTrackId(entry: LocalMusicEntry): string {
+  return entry.onlineId || entry.id
+}
+
+/**
+ * 本地导入文件转成播放用 Track。
+ * isLocalFile 是全 App「本地文件」标识的依据；source 在补全过在线信息后
+ * 用在线平台（歌词接口按 source 选平台），播放仍由 getMusicUrl 的本地命中拦下。
+ */
 function localEntryToTrack(entry: LocalMusicEntry): Track {
   return {
-    id: entry.id,
+    id: localEntryTrackId(entry),
     title: entry.title || '未知歌曲',
     artist: entry.artist || '本地文件',
     duration: 0,
     url: entry.fileUri,
-    source: 'local',
+    coverUrl: entry.coverUrl,
+    picUrl: entry.coverUrl,
+    source: entry.onlineSource || 'local',
+    songmid: entry.songmid,
+    isLocalFile: true,
   }
 }
 
@@ -532,7 +553,12 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
   const [localKeyword, setLocalKeyword] = useState('')
   const [localSortMode, setLocalSortMode] = useState<CacheSortMode>('recent')
   const [deletingLocalIds, setDeletingLocalIds] = useState<Record<string, boolean>>({})
+  const [localEnriching, setLocalEnriching] = useState(false)
+  const [localEnrichProgress, setLocalEnrichProgress] = useState<{ done: number; total: number } | null>(null)
+  const localEnrichRunningRef = useRef(false)
+  const localAutoEnrichTriedRef = useRef(false)
   const [logExporting, setLogExporting] = useState(false)
+  const [logDetail, setLogDetail] = useState<RuntimeLogEntry | null>(null)
   const [runtimeLogCount, setRuntimeLogCount] = useState(0)
   const [runtimeLastTimestamp, setRuntimeLastTimestamp] = useState<number | null>(null)
   const [runtimeLogPreview, setRuntimeLogPreview] = useState<RuntimeLogEntry[]>([])
@@ -724,6 +750,46 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
     setLocalStats(stats)
   }, [])
 
+  /**
+   * 联网补全本地歌曲的封面与在线曲目信息（歌词按在线 id 取）。
+   * 播放仍然走本地文件，这里只补元数据。
+   */
+  const runLocalEnrich = useCallback(async(announce = true) => {
+    if (localEnrichRunningRef.current) return
+    const entries = await localMusicLibrary.getEntries()
+    const pending = entries.filter((entry) => !entry.missing && !entry.onlineId && !entry.coverUrl)
+    if (!pending.length) {
+      if (announce) Alert.alert('无需补全', '本地歌曲都已经有封面与歌词信息了')
+      return
+    }
+
+    localEnrichRunningRef.current = true
+    setLocalEnriching(true)
+    setLocalEnrichProgress({ done: 0, total: pending.length })
+    try {
+      const result = await enrichLocalEntries(pending, (done, total) => {
+        setLocalEnrichProgress({ done, total })
+        // 边补边刷新，封面能立刻出现在列表里
+        void loadLocalLibrary()
+      })
+      await loadLocalLibrary()
+      if (announce) {
+        Alert.alert(
+          '补全完成',
+          `成功 ${result.ok} 首${result.failed ? `，未匹配到在线曲目 ${result.failed} 首` : ''}`
+        )
+      }
+    } catch (error) {
+      if (announce) {
+        Alert.alert('补全失败', error instanceof Error ? error.message : '请稍后重试')
+      }
+    } finally {
+      localEnrichRunningRef.current = false
+      setLocalEnriching(false)
+      setLocalEnrichProgress(null)
+    }
+  }, [loadLocalLibrary])
+
   /** 从"文件"App 选取音频，复制进 App 并按"歌名-歌手"解析登记 */
   const handleImportLocalMusicFiles = useCallback(async() => {
     if (localImporting) return
@@ -746,6 +812,8 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
 
       const importResult = await localMusicLibrary.importFiles(assets)
       await loadLocalLibrary()
+      // 后台补全封面与在线曲目信息，不阻塞导入结果提示
+      void runLocalEnrich(false)
 
       const lines: string[] = []
       if (importResult.imported.length) {
@@ -774,7 +842,7 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
     } finally {
       setLocalImporting(false)
     }
-  }, [loadLocalLibrary, localImporting])
+  }, [loadLocalLibrary, localImporting, runLocalEnrich])
 
   const handlePlayLocalTrack = useCallback((entry: LocalMusicEntry) => {
     if (entry.missing) {
@@ -791,7 +859,7 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
 
   const handleDeleteLocalTrack = useCallback((entry: LocalMusicEntry) => {
     if (deletingLocalIds[entry.id]) return
-    const isCurrentTrack = (currentTrackIdRef.current || '') === entry.id
+    const isCurrentTrack = (currentTrackIdRef.current || '') === localEntryTrackId(entry)
     Alert.alert(
       '删除本地歌曲',
       `确认删除「${entry.title}」吗？会一并删掉 App 内的文件副本，之后需要重新导入。`,
@@ -1137,6 +1205,16 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
   }, [loadLocalLibrary])
 
   useEffect(() => {
+    // 已导入但还没补全过封面/歌词的歌曲，每次启动自动补一次（后台跑，不打扰）
+    if (localAutoEnrichTriedRef.current) return
+    localAutoEnrichTriedRef.current = true
+    void (async() => {
+      await loadLocalLibrary()
+      await runLocalEnrich(false)
+    })()
+  }, [loadLocalLibrary, runLocalEnrich])
+
+  useEffect(() => {
     // 导入/删除可能在别的子页发生，进入这两个页面时重新读一次索引
     if (subPage !== 'local' && subPage !== 'cache') return
     void loadLocalLibrary()
@@ -1374,7 +1452,7 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
               entry={entry}
               colors={colors}
               deleting={Boolean(deletingLocalIds[entry.id])}
-              isCurrentTrack={currentTrackId === entry.id}
+              isCurrentTrack={currentTrackId === localEntryTrackId(entry)}
               reducedMotion={reduceMotionEnabled}
               isLast={index === Math.min(localEntries.length, MAIN_LOCAL_PREVIEW_COUNT) - 1}
               onPlay={handlePlayLocalTrack}
@@ -1753,7 +1831,8 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
               1. 文件名按「歌名-歌手」解析，例如「晴天-周杰伦.mp3」，横杠两边有没有空格都能识别{'\n'}
               2. 文件会复制进 App，不占用「文件」App 里的原件，删除 App 数据会丢失{'\n'}
               3. 搜索到同名歌曲时会自动命中本地文件播放，不再联网下载{'\n'}
-              4. 同名文件重复导入会覆盖旧文件
+              4. 同名文件重复导入会覆盖旧文件{'\n'}
+              5. 导入后会自动联网补全封面与歌词（按歌名 + 歌手匹配在线曲目），没补上的可点上方按钮重试
             </Text>
           </View>
           {localStats.missingCount > 0 && (
@@ -1783,6 +1862,24 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
                 : <Ionicons name="add-circle-outline" size={17} color={colors.accent} />}
               <Text style={[styles.dangerActionText, { color: colors.accent }]}>
                 {localImporting ? '正在导入...' : '从文件导入歌曲'}
+              </Text>
+            </View>
+          </MotionPressable>
+
+          <MotionPressable
+            onPress={() => void runLocalEnrich(true)}
+            reducedMotion={reduceMotionEnabled}
+            disabled={localEnriching}
+            style={styles.dangerAction}
+          >
+            <View style={styles.dangerActionInner}>
+              {localEnriching
+                ? <ActivityIndicator size="small" color={colors.textSecondary} />
+                : <Ionicons name="images-outline" size={17} color={colors.textSecondary} />}
+              <Text style={[styles.dangerActionText, { color: colors.textSecondary }]}>
+                {localEnriching && localEnrichProgress
+                  ? `补全中 ${localEnrichProgress.done}/${localEnrichProgress.total}`
+                  : '补全封面与歌词'}
               </Text>
             </View>
           </MotionPressable>
@@ -1858,7 +1955,7 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
               entry={entry}
               colors={colors}
               deleting={Boolean(deletingLocalIds[entry.id])}
-              isCurrentTrack={currentTrackId === entry.id}
+              isCurrentTrack={currentTrackId === localEntryTrackId(entry)}
               reducedMotion={reduceMotionEnabled}
               isLast={index === Math.min(visibleLocalEntries.length, LOCAL_LIST_RENDER_LIMIT) - 1}
               onPlay={handlePlayLocalTrack}
@@ -2039,7 +2136,7 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
               entry={entry}
               colors={colors}
               deleting={Boolean(deletingLocalIds[entry.id])}
-              isCurrentTrack={currentTrackId === entry.id}
+              isCurrentTrack={currentTrackId === localEntryTrackId(entry)}
               reducedMotion={reduceMotionEnabled}
               isLast={index === Math.min(localEntries.length, CACHE_LIST_RENDER_LIMIT) - 1}
               onPlay={handlePlayLocalTrack}
@@ -2096,12 +2193,7 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
 
   const renderLogsPage = () => {
     const previewList = [...runtimeLogPreview].slice(-80).reverse()
-    const levelColor = (level: RuntimeLogEntry['level']) => {
-      if (level === 'error') return colors.danger
-      if (level === 'warn') return '#E68A00'
-      if (level === 'info') return colors.accent
-      return colors.textSecondary
-    }
+    const levelColor = (level: RuntimeLogEntry['level']) => getLogLevelColor(level, colors)
 
     return (
       <>
@@ -2182,8 +2274,11 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
             )}
 
             {previewList.map((entry, index) => (
-              <View
+              <TouchableOpacity
                 key={entry.id}
+                activeOpacity={0.6}
+                onPress={() => setLogDetail(entry)}
+                accessibilityLabel={`查看日志详情：${entry.message}`}
                 style={[
                   styles.logItem,
                   index < previewList.length - 1
@@ -2203,7 +2298,7 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
                     {entry.meta}
                   </Text>
                 ) : null}
-              </View>
+              </TouchableOpacity>
             ))}
           </View>
         </View>
@@ -2311,6 +2406,59 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
             </ScrollView>
           )}
         </Animated.View>
+
+        <Modal
+          transparent
+          visible={Boolean(logDetail)}
+          animationType="fade"
+          onRequestClose={() => setLogDetail(null)}
+        >
+          <View style={styles.modalMask}>
+            <View style={[styles.modalCard, styles.logDetailCard, { backgroundColor: colors.surface }]}>
+              <View style={styles.logDetailHead}>
+                <Text style={[styles.modalTitle, styles.logDetailTitle, { color: colors.text }]}>日志详情</Text>
+                {logDetail && (
+                  <View style={[styles.logDetailLevel, { backgroundColor: colors.surfaceSecondary }]}>
+                    <Text
+                      style={[
+                        styles.logDetailLevelText,
+                        { color: getLogLevelColor(logDetail.level, colors) },
+                      ]}
+                    >
+                      {logDetail.level.toUpperCase()}
+                    </Text>
+                  </View>
+                )}
+              </View>
+
+              <Text style={[styles.logDetailTime, { color: colors.textTertiary }]}>
+                {logDetail ? formatDateTime(logDetail.timestamp) : ''}
+              </Text>
+
+              <ScrollView
+                style={[styles.logDetailScroll, { backgroundColor: colors.surfaceSecondary }]}
+                showsVerticalScrollIndicator
+              >
+                <Text selectable style={[styles.logDetailText, { color: colors.text }]}>
+                  {logDetail?.message}
+                </Text>
+                {logDetail?.meta ? (
+                  <Text selectable style={[styles.logDetailMeta, { color: colors.textSecondary }]}>
+                    {logDetail.meta}
+                  </Text>
+                ) : null}
+              </ScrollView>
+
+              <TouchableOpacity
+                style={[styles.modalBtn, styles.logDetailCloseBtn, { backgroundColor: colors.accent }]}
+                activeOpacity={0.8}
+                onPress={() => setLogDetail(null)}
+              >
+                <Text style={[styles.cardBtnText, { color: '#FFFFFF' }]}>关闭</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
 
         <Modal transparent visible={sponsorModalVisible} animationType="fade" onRequestClose={() => setSponsorModalVisible(false)}>
           <View style={styles.modalMask}>
@@ -2891,6 +3039,52 @@ const styles = StyleSheet.create({
   logItemMeta: {
     fontSize: fontSize.caption2,
     lineHeight: 16,
+  },
+  logDetailCard: {
+    width: '94%',
+    maxWidth: 520,
+    maxHeight: '80%',
+  },
+  logDetailHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+  },
+  logDetailTitle: {
+    flex: 1,
+    marginBottom: 0,
+  },
+  logDetailLevel: {
+    borderRadius: borderRadius.full,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 2,
+  },
+  logDetailLevelText: {
+    fontSize: fontSize.caption2,
+    fontWeight: '700',
+  },
+  logDetailTime: {
+    fontSize: fontSize.caption2,
+    marginTop: spacing.xs,
+    marginBottom: spacing.sm,
+  },
+  logDetailScroll: {
+    borderRadius: borderRadius.sm,
+    padding: spacing.sm,
+    maxHeight: 380,
+  },
+  logDetailText: {
+    fontSize: fontSize.caption1,
+    lineHeight: 18,
+  },
+  logDetailMeta: {
+    marginTop: spacing.sm,
+    fontSize: fontSize.caption2,
+    lineHeight: 16,
+  },
+  logDetailCloseBtn: {
+    flex: 0,
+    marginTop: spacing.md,
   },
 
   swipeHint: {

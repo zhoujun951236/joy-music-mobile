@@ -56,6 +56,16 @@ const seededRecords = [
     format: 'mp3',
     importedAt: 300,
   },
+  {
+    id: 'local_d',
+    fileUri: 'file:///docs/joy_local_music/local_d.mp3',
+    fileName: '好人好梦-孙悦&邰正宵.mp3',
+    title: '好人好梦',
+    artist: '孙悦&邰正宵',
+    size: 5000,
+    format: 'mp3',
+    importedAt: 400,
+  },
 ]
 
 beforeAll(() => {
@@ -73,6 +83,7 @@ describe('parseTrackFileName', () => {
     ['晴天 (Live) - 周杰伦.mp3', '晴天', '周杰伦'],
     ['晴天.mp3', '晴天', ''],
     ['  演员 - 薛之谦  .m4a', '演员', '薛之谦'],
+    ['好人好梦-孙悦&邰正宵.mp3', '好人好梦', '孙悦&邰正宵'],
   ]
 
   it.each(cases)('%s -> %s / %s', (fileName, title, artist) => {
@@ -113,5 +124,28 @@ describe('localMusicLibrary.findMatch', () => {
 
   it('歌名不存在时不命中', async () => {
     await expect(localMusicLibrary.findMatch('不存在的歌', '周杰伦')).resolves.toBeNull()
+  })
+
+  it('对唱歌曲：分隔符不同也算同一批歌手', async () => {
+    // 本地文件名是「孙悦&邰正宵」，搜索结果常写成「孙悦;邰正宵」「孙悦、邰正宵」
+    await expect(localMusicLibrary.findMatch('好人好梦', '孙悦;邰正宵')).resolves.toMatchObject({
+      id: 'local_d',
+    })
+    await expect(localMusicLibrary.findMatch('好人好梦', '孙悦、邰正宵')).resolves.toMatchObject({
+      id: 'local_d',
+    })
+    await expect(localMusicLibrary.findMatch('好人好梦', '孙悦/邰正宵')).resolves.toMatchObject({
+      id: 'local_d',
+    })
+  })
+
+  it('对唱歌曲：搜索结果只写其中一位歌手也能命中', async () => {
+    await expect(localMusicLibrary.findMatch('好人好梦', '孙悦')).resolves.toMatchObject({
+      id: 'local_d',
+    })
+  })
+
+  it('对唱歌曲：换成完全不同的歌手仍然不命中', async () => {
+    await expect(localMusicLibrary.findMatch('好人好梦', '张学友')).resolves.toBeNull()
   })
 })

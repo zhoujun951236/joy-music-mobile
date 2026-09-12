@@ -49,6 +49,19 @@ export interface LocalMusicEntry {
   importedAt: number
   /** 文件在磁盘上已经不存在（被系统/用户删掉），仅供 UI 展示 */
   missing?: boolean
+  /** 联网补全到的元数据：用于封面与歌词（播放仍然走本地文件） */
+  coverUrl?: string
+  onlineId?: string
+  onlineSource?: string
+  songmid?: string
+}
+
+/** 联网补全的元数据补丁 */
+export interface LocalMusicMetaPatch {
+  coverUrl?: string
+  onlineId?: string
+  onlineSource?: string
+  songmid?: string
 }
 
 export interface LocalMusicStats {
@@ -150,7 +163,45 @@ export function normalizeForMatch(input?: string): string {
     .toLowerCase()
     .replace(/[\(\[【「《][^\)\]】」》]*[\)\]】」》]/g, '')
     .replace(TRAILING_DECORATOR_REGEX, '')
-    .replace(/[\s·・•\-–—_,，.。!！?？'’‘"“”()（）\[\]【】「」<>《》/\\|+&]/g, '')
+    .replace(
+      /[\s·・•\-–—_,，.。;；、!！?？'’‘"“”()（）\[\]【】「」<>《》/\\|&＆+＋~～*＊@#$%^:：]/g,
+      ''
+    )
+}
+
+/** 多歌手分隔符：孙悦&邰正宵 / 孙悦;邰正宵 / 孙悦、邰正宵 / 孙悦/邰正宵 都要能拆开 */
+const ARTIST_SEPARATOR_REGEX = /[/\\|&＆+＋,，;；、\s]+/
+
+function normalizeArtistTokens(input?: string): string[] {
+  return String(input || '')
+    .split(ARTIST_SEPARATOR_REGEX)
+    .map((part) => normalizeForMatch(part))
+    .filter(Boolean)
+}
+
+/**
+ * 歌手是否算同一批人：
+ * - 归一化后完全相同
+ * - 或者按分隔符拆开后的歌手集合互为子集
+ *   （对唱/合唱常见：本地文件名写了「孙悦&邰正宵」，搜索结果只写「孙悦」）
+ */
+export function isArtistMatch(localArtist?: string, searchedArtist?: string): boolean {
+  const local = normalizeForMatch(localArtist)
+  const searched = normalizeForMatch(searchedArtist)
+  if (local && searched && local === searched) return true
+
+  const localTokens = normalizeArtistTokens(localArtist)
+  const searchedTokens = normalizeArtistTokens(searchedArtist)
+  if (!localTokens.length || !searchedTokens.length) return false
+
+  const localSet = new Set(localTokens)
+  const searchedSet = new Set(searchedTokens)
+  const smaller = localSet.size <= searchedSet.size ? localSet : searchedSet
+  const larger = localSet.size <= searchedSet.size ? searchedSet : localSet
+  for (const token of smaller) {
+    if (!larger.has(token)) return false
+  }
+  return true
 }
 
 /** 本地文件音质未知，按容器格式给一个展示用的近似值 */
@@ -219,6 +270,10 @@ class LocalMusicLibrary {
         format: record.format || getFileExtension(fileName),
         importedAt: record.importedAt,
         missing,
+        coverUrl: record.coverUrl || undefined,
+        onlineId: record.onlineId || undefined,
+        onlineSource: record.onlineSource || undefined,
+        songmid: record.songmid || undefined,
       })
     }
 
@@ -240,11 +295,18 @@ class LocalMusicLibrary {
       size: Number(entry.size || 0),
       format: entry.format,
       importedAt: Number(entry.importedAt || Date.now()),
+      coverUrl: entry.coverUrl,
+      onlineId: entry.onlineId,
+      onlineSource: entry.onlineSource,
+      songmid: entry.songmid,
     }))
     await replaceLocalMusicRecords(records)
   }
 
   private async list(): Promise<LocalMusicEntry[]> {
+    // 导入/删除会直接更新 this.entries，必须优先返回它；
+    // 否则 loadPromise 里缓存的是首次 hydrate 的旧数组，界面不会刷新。
+    if (this.entries) return this.entries
     if (!this.loadPromise) {
       this.loadPromise = this.hydrate().catch((error) => {
         console.warn('[LocalMusic] hydrate failed:', error)
@@ -281,6 +343,27 @@ class LocalMusicLibrary {
     return entries.find((entry) => entry.id === id) || null
   }
 
+  /** 写入联网补全到的封面 / 在线曲目信息（不影响播放走本地文件） */
+  async updateEntryMeta(id: string, patch: LocalMusicMetaPatch): Promise<LocalMusicEntry | null> {
+    if (!id) return null
+    const entries = await this.list()
+    const index = entries.findIndex((entry) => entry.id === id)
+    if (index < 0) return null
+
+    const updated: LocalMusicEntry = {
+      ...entries[index],
+      coverUrl: patch.coverUrl ?? entries[index].coverUrl,
+      onlineId: patch.onlineId ?? entries[index].onlineId,
+      onlineSource: patch.onlineSource ?? entries[index].onlineSource,
+      songmid: patch.songmid ?? entries[index].songmid,
+    }
+    const next = [...entries]
+    next[index] = updated
+    this.entries = next
+    await this.persist(next)
+    return updated
+  }
+
   /**
    * 搜索/在线歌曲命中本地文件：
    * 1) 歌名 + 歌手都一致才算命中
@@ -295,15 +378,26 @@ class LocalMusicLibrary {
     const usable = entries.filter((entry) => !entry.missing)
     const sameTitle = usable.filter((entry) => normalizeForMatch(entry.title) === targetTitle)
 
-    if (targetArtist) {
-      const strictHit = sameTitle.find(
-        (entry) => normalizeForMatch(entry.artist) === targetArtist
+    if (!sameTitle.length) {
+      console.log(
+        `[LocalMusic] No local file titled "${title || ''}" (searched artist: "${artist || ''}")`
       )
+      return null
+    }
+
+    if (targetArtist) {
+      const strictHit = sameTitle.find((entry) => isArtistMatch(entry.artist, artist))
       if (strictHit) return strictHit
-      // 搜索侧带了歌手却没对上：只有本地文件本身没写歌手时才退化匹配，
-      // 否则宁可放过也不要放错歌（同名不同歌手）。
+      // 歌名对上了但歌手对不上：只有本地文件本身没写歌手时才退化匹配，
+      // 否则宁可放过也不要放错歌（同名不同歌手）。留一条日志方便排查。
       const unnamed = sameTitle.filter((entry) => !normalizeForMatch(entry.artist))
-      return unnamed.length === 1 ? unnamed[0] : null
+      if (unnamed.length === 1) return unnamed[0]
+      console.log(
+        `[LocalMusic] Title "${title}" matched but artist differs: local="${sameTitle
+          .map((entry) => entry.artist)
+          .join(' / ')}" vs searched="${artist}"`
+      )
+      return null
     }
 
     // 搜索侧没有歌手信息：同歌名且唯一才命中
