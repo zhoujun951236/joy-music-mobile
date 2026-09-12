@@ -173,6 +173,21 @@ export const musicUrlCache = new MusicUrlCache()
 export const lyricCache = new LyricCache()
 
 /**
+ * Clear every playback related cache of a single track
+ * (playback URL + local audio file).
+ * Lyric cache is kept on purpose: it is tiny text and shared by other views.
+ */
+export const clearTrackCacheById = async(musicId: string): Promise<void> => {
+  const id = String(musicId || '').trim()
+  if (!id) return
+  await Promise.all([
+    musicUrlCache.clearMusicUrl(id),
+    audioFileCache.clearCachedAudioByMusicId(id),
+  ])
+  console.log(`[Cache] Cleared track cache for ${id}`)
+}
+
+/**
  * Clear all cached data
  */
 export const clearAllCache = async(): Promise<void> => {

@@ -65,6 +65,11 @@ export interface AudioCacheStats {
   sizeBytes: number
 }
 
+export interface AudioCacheOverview extends AudioCacheStats {
+  /** 全部有效缓存条目，按最近缓存时间倒序排列 */
+  entries: CachedAudioFileEntry[]
+}
+
 export interface AudioCacheStoreRequest {
   musicId: string
   url: string
@@ -254,7 +259,8 @@ async function migrateLegacyCacheIfNeeded(
     }
 
     // —— Step 2：修补索引 fileUri（含 UUID 漂移修复） ——
-    await rewriteIndexUriForCurrentSandbox(loadIndex, saveIndex)
+    const { patched: indexPatchedCount, dropped: indexDroppedCount } =
+      await rewriteIndexUriForCurrentSandbox(loadIndex, saveIndex)
 
     // —— Step 3：扫 newDir 里"实际存在但索引里没记录"的孤儿文件，按文件名反向重建 ——
     await selfHealOrphanFiles(loadIndex, saveIndex)
@@ -295,7 +301,7 @@ async function migrateLegacyCacheIfNeeded(
 async function rewriteIndexUriForCurrentSandbox(
   loadIndex: () => Promise<Record<string, CachedAudioFileEntry>>,
   saveIndex: (next: Record<string, CachedAudioFileEntry>) => Promise<void>,
-): Promise<void> {
+): Promise<{ patched: number; dropped: number }> {
   try {
     const newDir = await getCacheDir()
     const index = await loadIndex()
@@ -328,8 +334,10 @@ async function rewriteIndexUriForCurrentSandbox(
       await saveIndex(index)
       console.log(`[AudioCache] Rewrite index uri for current sandbox: patched=${patched}, dropped=${dropped}`)
     }
+    return { patched, dropped }
   } catch (error) {
     console.warn('[AudioCache] rewriteIndexUriForCurrentSandbox failed:', error)
+    return { patched: 0, dropped: 0 }
   }
 }
 
@@ -424,6 +432,8 @@ class AudioFileCacheManager {
   private settingsCache: AudioCacheSettings | null = null
   private indexCache: Record<string, CachedAudioFileEntry> | null = null
   private inFlightTasks = new Map<string, Promise<void>>()
+  /** 下载进行中收到删除请求的歌曲，下载结束后需要再删一次，避免“删完又被写回” */
+  private pendingClears = new Set<string>()
   private migrationPromise: Promise<void> | null = null
 
   private async ensureMigrated(): Promise<void> {
@@ -598,14 +608,34 @@ class AudioFileCacheManager {
 
   async clearCachedAudioByMusicId(musicId: string): Promise<void> {
     if (!musicId) return
+
+    // 该歌曲可能正在下载：先登记删除意图，等下载任务结束后再清理一次，
+    // 否则下载完成时会把文件和索引重新写回。
+    this.schedulePendingClear(musicId)
+
+    await this.deleteEntryByMusicId(musicId)
+  }
+
+  private schedulePendingClear(musicId: string): void {
+    const inFlight = this.inFlightTasks.get(musicId)
+    if (!inFlight || this.pendingClears.has(musicId)) return
+    this.pendingClears.add(musicId)
+    void inFlight.then(() => {
+      if (!this.pendingClears.delete(musicId)) return
+      void this.deleteEntryByMusicId(musicId)
+    })
+  }
+
+  private async deleteEntryByMusicId(musicId: string): Promise<boolean> {
     const index = await this.readIndex()
     const entry = index[musicId]
-    if (!entry) return
+    if (!entry) return false
 
     await this.removeFileIfExists(entry.fileUri)
     delete index[musicId]
     await this.saveIndex(index)
     console.log(`[AudioCache] Cleared cached audio for ${musicId}`)
+    return true
   }
 
   async resolveCachedPlayableUrl(
@@ -746,7 +776,11 @@ class AudioFileCacheManager {
     return task
   }
 
-  async getStats(): Promise<AudioCacheStats> {
+  /**
+   * 缓存总览：统计信息 + 全部有效条目（按最近缓存时间倒序）。
+   * 同时顺带清理索引里已经不存在于磁盘的失效记录。
+   */
+  async getCacheOverview(): Promise<AudioCacheOverview> {
     const settings = await this.readSettings()
     const index = await this.readIndex()
     const nextIndex: Record<string, CachedAudioFileEntry> = {}
@@ -778,11 +812,19 @@ class AudioFileCacheManager {
       await this.saveIndex(nextIndex)
     }
 
+    const entries = Object.values(nextIndex).sort((a, b) => b.updatedAt - a.updatedAt)
+
     return {
       enabled: settings.enabled,
       fileCount,
       sizeBytes,
+      entries,
     }
+  }
+
+  async getStats(): Promise<AudioCacheStats> {
+    const { enabled, fileCount, sizeBytes } = await this.getCacheOverview()
+    return { enabled, fileCount, sizeBytes }
   }
 
   async clearAllCachedAudio(): Promise<void> {
@@ -794,6 +836,11 @@ class AudioFileCacheManager {
     }
     await this.ensureDir()
     await this.saveIndex({})
+
+    // 清空时仍在下载的任务结束后会把文件写回缓存目录，登记一次延迟清理。
+    Array.from(this.inFlightTasks.keys()).forEach((musicId) => {
+      this.schedulePendingClear(musicId)
+    })
   }
 }
 

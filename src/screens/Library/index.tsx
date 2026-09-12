@@ -33,7 +33,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { Ionicons } from '@expo/vector-icons'
 import * as DocumentPicker from 'expo-document-picker'
 import * as FileSystem from 'expo-file-system/legacy'
-import { useTheme, spacing, fontSize, borderRadius, BOTTOM_INSET } from '../../theme'
+import { useTheme, spacing, fontSize, borderRadius, BOTTOM_INSET, type ThemeColors } from '../../theme'
 import { useDispatch, useSelector } from 'react-redux'
 import { RootState } from '../../store'
 import { ThemeMode, Track, type TrackMoreActionHandler } from '../../types/music'
@@ -44,7 +44,8 @@ import {
   createSourceFromScriptText,
   ImportedMusicSource,
 } from '../../core/config/musicSource'
-import { audioFileCache, formatCacheSize } from '../../core/music/audioCache'
+import { audioFileCache, formatCacheSize, type CachedAudioFileEntry } from '../../core/music/audioCache'
+import { clearTrackCacheById } from '../../core/music/cache'
 import { playerController } from '../../core/player'
 import QueueSheet from '../NowPlaying/QueueSheet'
 import { emitScrollTopState, subscribeScrollToTop } from '../../core/ui/scrollToTopBus'
@@ -155,6 +156,44 @@ function formatDateTime(timestamp: number | null): string {
   return `${mm}-${dd} ${hh}:${mi}:${ss}`
 }
 
+type CacheSortMode = 'recent' | 'size'
+
+/** 缓存列表最多渲染的条数，超出部分可用搜索定位，避免超长列表拖慢设置页 */
+const CACHE_LIST_RENDER_LIMIT = 200
+
+const CACHE_SOURCE_LABELS: Record<string, string> = {
+  joy: 'Joy',
+  wy: '网易云',
+  kg: '酷狗',
+  kw: '酷我',
+  mg: '咪咕',
+  tx: 'QQ 音乐',
+}
+
+function formatCacheSourceLabel(source?: string): string {
+  const key = String(source || '').trim().toLowerCase()
+  if (!key) return '未知来源'
+  return CACHE_SOURCE_LABELS[key] || key.toUpperCase()
+}
+
+function formatCachedAt(timestamp: number): string {
+  if (!timestamp) return '时间未知'
+  const diff = Date.now() - timestamp
+  const minute = 60 * 1000
+  const hour = 60 * minute
+  const day = 24 * hour
+  if (diff < minute) return '刚刚缓存'
+  if (diff < hour) return `${Math.floor(diff / minute)} 分钟前`
+  if (diff < day) return `${Math.floor(diff / hour)} 小时前`
+  if (diff < 7 * day) return `${Math.floor(diff / day)} 天前`
+  const date = new Date(timestamp)
+  return `${date.getMonth() + 1}月${date.getDate()}日`
+}
+
+function buildCacheEntriesSignature(entries: CachedAudioFileEntry[]): string {
+  return entries.map((entry) => `${entry.musicId}:${entry.size}:${entry.updatedAt}`).join('|')
+}
+
 function MotionPressable({
   children,
   onPress,
@@ -190,6 +229,82 @@ function MotionPressable({
     </Animated.View>
   )
 }
+
+interface CachedSongRowProps {
+  entry: CachedAudioFileEntry
+  colors: ThemeColors
+  deleting: boolean
+  isCurrentTrack: boolean
+  reducedMotion: boolean
+  isLast: boolean
+  onDelete: (entry: CachedAudioFileEntry) => void
+}
+
+const CachedSongRow = React.memo(function CachedSongRow({
+  entry,
+  colors,
+  deleting,
+  isCurrentTrack,
+  reducedMotion,
+  isLast,
+  onDelete,
+}: CachedSongRowProps) {
+  const title = entry.title?.trim() || '未知歌曲'
+  const artist = entry.artist?.trim() || '未知歌手'
+  const metaText = [
+    String(entry.quality || '').toUpperCase(),
+    formatCacheSourceLabel(entry.source),
+    formatCachedAt(entry.updatedAt),
+  ].filter(Boolean).join(' · ')
+
+  return (
+    <View
+      style={[
+        styles.cacheRow,
+        !isLast && {
+          borderBottomWidth: StyleSheet.hairlineWidth,
+          borderBottomColor: colors.separator,
+        },
+      ]}
+    >
+      <View style={[styles.cacheRowIcon, { backgroundColor: colors.accentLight }]}>
+        <Ionicons
+          name={isCurrentTrack ? 'volume-high' : 'musical-note'}
+          size={16}
+          color={colors.accent}
+        />
+      </View>
+
+      <View style={styles.cacheRowMeta}>
+        <Text style={[styles.cacheRowTitle, { color: colors.text }]} numberOfLines={1}>
+          {title}
+        </Text>
+        <Text style={[styles.cacheRowSubtitle, { color: colors.textSecondary }]} numberOfLines={1}>
+          {artist}{isCurrentTrack ? ' · 正在播放' : ''}
+        </Text>
+        <Text style={[styles.cacheRowInfo, { color: colors.textTertiary }]} numberOfLines={1}>
+          {metaText}
+        </Text>
+      </View>
+
+      <View style={styles.cacheRowRight}>
+        <Text style={[styles.cacheRowSize, { color: colors.text }]}>{formatCacheSize(entry.size)}</Text>
+        <MotionPressable
+          onPress={() => onDelete(entry)}
+          reducedMotion={reducedMotion}
+          disabled={deleting}
+          style={[styles.cacheRowDeleteBtn, { backgroundColor: 'rgba(255,59,48,0.14)' }]}
+        >
+          <View style={styles.cacheRowDeleteInner}>
+            {deleting
+              ? <ActivityIndicator size="small" color={colors.danger} />
+              : <Ionicons name="trash-outline" size={15} color={colors.danger} />}
+          </View>
+        </MotionPressable>
+      </View>
+    </View>
+  )
+})
 
 function EntryCard({ icon, title, subtitle, onPress, reducedMotion }: EntryCardProps) {
   const { colors } = useTheme()
@@ -268,6 +383,8 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
   const pageAnim = useRef(new Animated.Value(1)).current
   const mainListRef = useRef<FlatList<Track> | null>(null)
   const subPageScrollRef = useRef<ScrollView | null>(null)
+  // 供缓存删除回调读取当前播放歌曲，避免把 playerState 放进依赖导致每帧重建回调
+  const currentTrackIdRef = useRef<string | null>(null)
 
   const [sourceModalVisible, setSourceModalVisible] = useState(false)
   const [sourceModalMode, setSourceModalMode] = useState<SourceModalMode>('manual')
@@ -283,6 +400,11 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
   const [cacheEnabled, setCacheEnabled] = useState(true)
   const [cacheFileCount, setCacheFileCount] = useState(0)
   const [cacheSizeBytes, setCacheSizeBytes] = useState(0)
+  const [cacheEntries, setCacheEntries] = useState<CachedAudioFileEntry[]>([])
+  const [cacheKeyword, setCacheKeyword] = useState('')
+  const [cacheSortMode, setCacheSortMode] = useState<CacheSortMode>('recent')
+  const [deletingCacheIds, setDeletingCacheIds] = useState<Record<string, boolean>>({})
+  const cacheEntriesSignatureRef = useRef('')
   const [logExporting, setLogExporting] = useState(false)
   const [runtimeLogCount, setRuntimeLogCount] = useState(0)
   const [runtimeLastTimestamp, setRuntimeLastTimestamp] = useState<number | null>(null)
@@ -305,7 +427,20 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
           : '关于'
 
   const queueCount = playerState.playlist.length
+  const currentTrackId = playerState.currentTrack?.id ?? null
   const cacheSummaryText = `${cacheEnabled ? '已开启' : '已关闭'} · ${formatCacheSize(cacheSizeBytes)}`
+  const visibleCacheEntries = useMemo(() => {
+    const keyword = cacheKeyword.trim().toLowerCase()
+    const matched = keyword
+      ? cacheEntries.filter((entry) => {
+        const haystack = `${entry.title || ''} ${entry.artist || ''} ${entry.musicId}`.toLowerCase()
+        return haystack.includes(keyword)
+      })
+      : [...cacheEntries]
+    return cacheSortMode === 'size'
+      ? matched.sort((a, b) => b.size - a.size)
+      : matched
+  }, [cacheEntries, cacheKeyword, cacheSortMode])
   const runtimeLogSummaryText = runtimeLogCount
     ? `${runtimeLogCount} 条 · 最近 ${formatDateTime(runtimeLastTimestamp)}`
     : '暂无运行日志'
@@ -340,10 +475,16 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
   const loadAudioCacheStats = useCallback(async(silent = false) => {
     if (!silent) setCacheLoading(true)
     try {
-      const stats = await audioFileCache.getStats()
-      setCacheEnabled(stats.enabled)
-      setCacheFileCount(stats.fileCount)
-      setCacheSizeBytes(stats.sizeBytes)
+      const overview = await audioFileCache.getCacheOverview()
+      setCacheEnabled(overview.enabled)
+      setCacheFileCount(overview.fileCount)
+      setCacheSizeBytes(overview.sizeBytes)
+      // 缓存详情页每 6 秒轮询一次，内容没变时跳过 setState，避免列表无谓重渲染。
+      const signature = buildCacheEntriesSignature(overview.entries)
+      if (signature !== cacheEntriesSignatureRef.current) {
+        cacheEntriesSignatureRef.current = signature
+        setCacheEntries(overview.entries)
+      }
     } finally {
       if (!silent) setCacheLoading(false)
     }
@@ -355,8 +496,53 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
     void loadAudioCacheStats(true)
   }, [loadAudioCacheStats])
 
+  /** 单首删除：先本地乐观移除，再落盘并回读真实占用 */
+  const deleteSingleCacheEntry = useCallback(async(entry: CachedAudioFileEntry) => {
+    setDeletingCacheIds((prev) => ({ ...prev, [entry.musicId]: true }))
+    try {
+      await clearTrackCacheById(entry.musicId)
+      setCacheEntries((prev) => prev.filter((item) => item.musicId !== entry.musicId))
+      setCacheFileCount((prev) => Math.max(0, prev - 1))
+      setCacheSizeBytes((prev) => Math.max(0, prev - Math.max(0, entry.size)))
+      await loadAudioCacheStats(true)
+    } catch (error) {
+      Alert.alert('删除失败', error instanceof Error ? error.message : '请稍后重试')
+      await loadAudioCacheStats(true)
+    } finally {
+      setDeletingCacheIds((prev) => {
+        if (!prev[entry.musicId]) return prev
+        const next = { ...prev }
+        delete next[entry.musicId]
+        return next
+      })
+    }
+  }, [loadAudioCacheStats])
+
+  const handleDeleteSingleCache = useCallback((entry: CachedAudioFileEntry) => {
+    if (deletingCacheIds[entry.musicId]) return
+    const title = entry.title?.trim() || '未知歌曲'
+    const isCurrentTrack = (currentTrackIdRef.current || '') === entry.musicId
+
+    if (!isCurrentTrack) {
+      void deleteSingleCacheEntry(entry)
+      return
+    }
+
+    Alert.alert('删除缓存', `「${title}」正在播放，删除本地文件后播放可能中断，仍要删除吗？`, [
+      { text: '取消', style: 'cancel' },
+      {
+        text: '删除',
+        style: 'destructive',
+        onPress: () => void deleteSingleCacheEntry(entry),
+      },
+    ])
+  }, [deleteSingleCacheEntry, deletingCacheIds])
+
   const handleClearAudioCache = useCallback(() => {
-    Alert.alert('清空本地缓存', '确认删除所有已缓存歌曲吗？删除后将重新走在线获取。', [
+    const summary = cacheFileCount
+      ? `确认删除全部 ${cacheFileCount} 首已缓存歌曲（${formatCacheSize(cacheSizeBytes)}）吗？删除后将重新走在线获取。`
+      : '确认删除所有已缓存歌曲吗？删除后将重新走在线获取。'
+    Alert.alert('清空本地缓存', summary, [
       { text: '取消', style: 'cancel' },
       {
         text: '清空',
@@ -366,6 +552,8 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
             try {
               setCacheLoading(true)
               await audioFileCache.clearAllCachedAudio()
+              setCacheEntries([])
+              cacheEntriesSignatureRef.current = ''
               await loadAudioCacheStats(true)
               Alert.alert('已清空', '本地歌曲缓存已删除')
             } catch (error) {
@@ -377,7 +565,11 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
         },
       },
     ])
-  }, [loadAudioCacheStats])
+  }, [cacheFileCount, cacheSizeBytes, loadAudioCacheStats])
+
+  const handleToggleCacheSort = useCallback(() => {
+    setCacheSortMode((prev) => (prev === 'recent' ? 'size' : 'recent'))
+  }, [])
 
   const refreshRuntimeLogState = useCallback(() => {
     const stats = getRuntimeLogStats()
@@ -670,6 +862,10 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
   useEffect(() => {
     void loadAudioCacheStats()
   }, [loadAudioCacheStats])
+
+  useEffect(() => {
+    currentTrackIdRef.current = currentTrackId
+  }, [currentTrackId])
 
   useEffect(() => {
     refreshRuntimeLogState()
@@ -1206,21 +1402,114 @@ export default function LibraryScreen({ onTrackPress, onTrackMorePress, onDetail
 
       <View style={styles.section}>
         <View style={styles.sectionHeader}>
-          <Text style={[styles.sectionTitle, { color: colors.text }]}>缓存管理</Text>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>已缓存歌曲</Text>
+          <Text style={[styles.sectionSubtitle, { color: colors.textSecondary }]}>
+            {cacheLoading && !cacheEntries.length
+              ? '读取中...'
+              : cacheKeyword.trim()
+                ? `匹配 ${visibleCacheEntries.length} / ${cacheEntries.length} 首`
+                : `共 ${cacheEntries.length} 首`}
+          </Text>
+        </View>
+
+        <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.separator }]}>
+          <View style={[styles.cacheToolbar, { borderBottomColor: colors.separator }]}>
+            <View style={[styles.cacheSearchWrap, { backgroundColor: colors.surfaceSecondary }]}>
+              <Ionicons name="search-outline" size={14} color={colors.textTertiary} />
+              <TextInput
+                style={[styles.cacheSearchInput, { color: colors.text }]}
+                value={cacheKeyword}
+                onChangeText={setCacheKeyword}
+                placeholder="搜索歌名 / 歌手 / ID"
+                placeholderTextColor={colors.searchPlaceholder}
+                returnKeyType="search"
+                clearButtonMode="never"
+              />
+              {cacheKeyword.length > 0 && (
+                <TouchableOpacity
+                  onPress={() => setCacheKeyword('')}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  accessibilityLabel="清除搜索关键字"
+                >
+                  <Ionicons name="close-circle" size={15} color={colors.textTertiary} />
+                </TouchableOpacity>
+              )}
+            </View>
+
+            <MotionPressable
+              onPress={handleToggleCacheSort}
+              reducedMotion={reduceMotionEnabled}
+              style={[styles.cacheSortBtn, { backgroundColor: colors.surfaceSecondary }]}
+            >
+              <View style={styles.cacheSortBtnInner}>
+                <Ionicons
+                  name={cacheSortMode === 'size' ? 'resize-outline' : 'time-outline'}
+                  size={13}
+                  color={colors.textSecondary}
+                />
+                <Text style={[styles.cacheSortBtnText, { color: colors.textSecondary }]}>
+                  {cacheSortMode === 'size' ? '占用最大' : '最近缓存'}
+                </Text>
+              </View>
+            </MotionPressable>
+          </View>
+
+          {visibleCacheEntries.length === 0 && (
+            <View style={styles.cacheEmptyWrap}>
+              <Ionicons name="cloud-download-outline" size={22} color={colors.textTertiary} />
+              <Text style={[styles.cacheEmptyText, { color: colors.textSecondary }]}>
+                {cacheEntries.length === 0 ? '还没有缓存歌曲，播放后会自动缓存' : '没有匹配的歌曲'}
+              </Text>
+            </View>
+          )}
+
+          {visibleCacheEntries.slice(0, CACHE_LIST_RENDER_LIMIT).map((entry, index) => (
+            <CachedSongRow
+              key={entry.musicId}
+              entry={entry}
+              colors={colors}
+              deleting={Boolean(deletingCacheIds[entry.musicId])}
+              isCurrentTrack={currentTrackId === entry.musicId}
+              reducedMotion={reduceMotionEnabled}
+              isLast={index === Math.min(visibleCacheEntries.length, CACHE_LIST_RENDER_LIMIT) - 1}
+              onDelete={handleDeleteSingleCache}
+            />
+          ))}
+
+          {visibleCacheEntries.length > CACHE_LIST_RENDER_LIMIT && (
+            <View style={[styles.cacheMoreHint, { borderTopColor: colors.separator }]}>
+              <Text style={[styles.cacheMoreHintText, { color: colors.textTertiary }]}>
+                仅显示前 {CACHE_LIST_RENDER_LIMIT} 条，可用上方搜索定位其他歌曲
+              </Text>
+            </View>
+          )}
+        </View>
+      </View>
+
+      <View style={styles.section}>
+        <View style={styles.sectionHeader}>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>批量清理</Text>
           <Text style={[styles.sectionSubtitle, { color: colors.textSecondary }]}>{cacheLoading ? '处理中...' : '危险操作'}</Text>
         </View>
         <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.separator }]}>
+          <View style={[styles.dangerHintWrap, { borderBottomColor: colors.separator }]}>
+            <Text style={[styles.rowDesc, { color: colors.textSecondary }]}>
+              单首删除请在上方列表操作；此处会一次性删除全部本地歌曲缓存。
+            </Text>
+          </View>
           <MotionPressable
             onPress={handleClearAudioCache}
             reducedMotion={reduceMotionEnabled}
-            disabled={cacheLoading}
+            disabled={cacheLoading || cacheFileCount === 0}
             style={styles.dangerAction}
           >
             <View style={styles.dangerActionInner}>
               {cacheLoading
                 ? <ActivityIndicator size="small" color={colors.danger} />
-                : <Ionicons name="trash-outline" size={17} color={colors.danger} />}
-              <Text style={[styles.dangerActionText, { color: colors.danger }]}>删除本地缓存</Text>
+                : <Ionicons name="trash-outline" size={17} color={cacheFileCount === 0 ? colors.textTertiary : colors.danger} />}
+              <Text style={[styles.dangerActionText, { color: cacheFileCount === 0 ? colors.textTertiary : colors.danger }]}>
+                删除全部本地缓存
+              </Text>
             </View>
           </MotionPressable>
         </View>
@@ -1835,6 +2124,94 @@ const styles = StyleSheet.create({
   cacheStatValue: {
     fontSize: fontSize.subhead,
     fontWeight: '700',
+  },
+  cacheToolbar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  cacheSearchWrap: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    height: 32,
+    borderRadius: borderRadius.sm,
+    paddingHorizontal: spacing.sm,
+  },
+  cacheSearchInput: {
+    flex: 1,
+    fontSize: fontSize.caption1,
+    paddingVertical: 0,
+  },
+  cacheSortBtn: {
+    borderRadius: borderRadius.sm,
+    overflow: 'hidden',
+  },
+  cacheSortBtnInner: {
+    height: 32,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    paddingHorizontal: spacing.sm,
+  },
+  cacheSortBtnText: { fontSize: fontSize.caption2, fontWeight: '700' },
+  cacheEmptyWrap: {
+    minHeight: 96,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.xs,
+    paddingHorizontal: spacing.md,
+  },
+  cacheEmptyText: { fontSize: fontSize.caption1, textAlign: 'center' },
+  cacheRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+  },
+  cacheRowIcon: {
+    width: 34,
+    height: 34,
+    borderRadius: borderRadius.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cacheRowMeta: { flex: 1 },
+  cacheRowTitle: { fontSize: fontSize.subhead, fontWeight: '600' },
+  cacheRowSubtitle: { marginTop: 1, fontSize: fontSize.caption1 },
+  cacheRowInfo: { marginTop: 1, fontSize: fontSize.caption2 },
+  cacheRowRight: {
+    alignItems: 'flex-end',
+    gap: spacing.xs,
+  },
+  cacheRowSize: { fontSize: fontSize.caption1, fontWeight: '700' },
+  cacheRowDeleteBtn: {
+    borderRadius: borderRadius.sm,
+    overflow: 'hidden',
+  },
+  cacheRowDeleteInner: {
+    width: 30,
+    height: 30,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cacheMoreHint: {
+    borderTopWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    alignItems: 'center',
+  },
+  cacheMoreHintText: { fontSize: fontSize.caption2, textAlign: 'center' },
+  dangerHintWrap: {
+    paddingHorizontal: spacing.md,
+    paddingTop: spacing.sm,
+    paddingBottom: spacing.xs,
+    borderBottomWidth: StyleSheet.hairlineWidth,
   },
   dangerAction: {
     borderRadius: borderRadius.sm,

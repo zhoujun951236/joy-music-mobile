@@ -13,8 +13,7 @@ import {
   MusicUrlProgress,
   MusicUrlResponse,
 } from './url'
-import { musicUrlCache, clearAllCache } from './cache'
-import { audioFileCache } from './audioCache'
+import { clearAllCache, clearTrackCacheById } from './cache'
 
 // Initialize music sources on module load
 const initializeMusicSources = () => {
@@ -173,13 +172,10 @@ class MusicManager {
   async clearTrackCache(musicInfo: any): Promise<void> {
     const musicId = String(musicInfo?.id || musicInfo?.songmid || musicInfo?.hash || '').trim()
     if (!musicId) return
-    await Promise.all([
-      musicUrlCache.clearMusicUrl(musicId),
-      audioFileCache.clearCachedAudioByMusicId(musicId),
-    ])
+    await clearTrackCacheById(musicId)
   }
 }
 
 export default new MusicManager()
-export { musicSourceManager, getMusicUrl, getMusicUrlWithRetry }
+export { musicSourceManager, getMusicUrl, getMusicUrlWithRetry, clearTrackCacheById }
 export type { Quality, MusicSourceInfo, MusicSourceAPI } from './source'
