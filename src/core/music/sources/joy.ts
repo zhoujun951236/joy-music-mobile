@@ -654,10 +654,10 @@ function buildQualityAttempts(requestedQuality: Quality, supportedQualities: Qua
 
 function normalizeTemplatePlaceholders(raw: string): string {
   return raw
-    .replace(/\$\{\s*source\s*\}/gi, '{source}')
-    .replace(/\$\{\s*quality\s*\}/gi, '{quality}')
-    .replace(/\$\{\s*level\s*\}/gi, '{level}')
-    .replace(/\$\{\s*(?:songId|musicId|id|hash|songmid)\s*\}/gi, '{songId}')
+    .replace(/\${\s*(?:encodeURIComponent\s*\(\s*)?source\s*(?:\)\s*)?\}/gi, '{source}')
+    .replace(/\${\s*(?:encodeURIComponent\s*\(\s*)?(?:songId|musicId|id|hash|songmid)\s*(?:\)\s*)?\}/gi, '{songId}')
+    .replace(/\${\s*(?:encodeURIComponent\s*\(\s*)?quality\s*(?:\)\s*)?\}/gi, '{quality}')
+    .replace(/\${\s*(?:encodeURIComponent\s*\(\s*)?level\s*(?:\)\s*)?\}/gi, '{level}')
 }
 
 function escapeRegExp(input: string): string {
