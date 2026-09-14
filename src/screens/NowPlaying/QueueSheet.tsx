@@ -33,6 +33,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useDispatch, useSelector } from 'react-redux';
 import { useTheme, spacing, fontSize, borderRadius } from '../../theme';
 import { playerController } from '../../core/player';
+import { clearTrackCacheById } from '../../core/music/cache';
 import type { RootState } from '../../store';
 import type { Track } from '../../types/music';
 
@@ -288,6 +289,55 @@ function QueueSheet({
     [onClose, onSyncStore],
   );
 
+  /**
+   * 移除播放列表 + 清理该歌曲缓存。
+   * 本地导入的歌曲不清理：那是用户自己放进来的文件，由用户在「本地音乐」里管理。
+   */
+  const handleRemoveQueueTrackAndCache = useCallback(
+    async (track: Track) => {
+      const isLocalFile =
+        track.isLocalFile === true ||
+        String(track.source || '').toLowerCase() === 'local';
+      try {
+        const removed = await playerController.removeTrackFromQueue(track);
+        if (!removed) {
+          Alert.alert('提示', '当前播放列表中未找到该歌曲。');
+          return;
+        }
+        const latestQueue = playerController.getPlaylist();
+        setQueueDraft(latestQueue);
+        if (!latestQueue.length) {
+          onClose();
+        }
+        onSyncStore();
+
+        if (isLocalFile) {
+          Alert.alert(
+            '已移除',
+            `「${track.title}」已移出播放列表。本地导入的文件未删除，可在「我的 > 本地音乐」中管理。`,
+          );
+          return;
+        }
+
+        const musicId = String(track.id || track.songmid || track.hash || '').trim();
+        if (!musicId) {
+          Alert.alert('已移除', `「${track.title}」已移出播放列表（未找到可清理的缓存标识）。`);
+          return;
+        }
+
+        await clearTrackCacheById(musicId);
+        Alert.alert(
+          '已移除并清理缓存',
+          `「${track.title}」已移出播放列表，本地音频缓存与播放地址缓存已删除，下次播放将重新在线获取。`,
+        );
+      } catch (error) {
+        console.error('Remove queue track and cache error:', error);
+        Alert.alert('操作失败', '移除或清理缓存失败，请稍后重试。');
+      }
+    },
+    [onClose, onSyncStore],
+  );
+
   const handleQueueTrackMorePress = useCallback(
     (track: Track) => {
       Alert.alert(
@@ -307,11 +357,18 @@ function QueueSheet({
               void handleRemoveQueueTrack(track);
             },
           },
+          {
+            text: '移除播放列表与缓存',
+            style: 'destructive',
+            onPress: () => {
+              void handleRemoveQueueTrackAndCache(track);
+            },
+          },
           { text: '取消', style: 'cancel' },
         ],
       );
     },
-    [handleAddQueueTrackToPlaylist, handleRemoveQueueTrack],
+    [handleAddQueueTrackToPlaylist, handleRemoveQueueTrack, handleRemoveQueueTrackAndCache],
   );
 
   const handleClearQueue = useCallback(() => {
