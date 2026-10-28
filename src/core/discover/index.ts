@@ -100,6 +100,14 @@ export function getSongListSortList(source: DiscoverSourceId): SongListSortInfo[
   return adapter(source).songList.sortList || []
 }
 
+/**
+ * 该平台在选中标签后排序是否仍然生效。
+ * 返回 false 时 UI 会把排序选项置灰，避免展示"点了不会有任何变化"的控件。
+ */
+export function getSongListSortAppliesWithTag(source: DiscoverSourceId): boolean {
+  return adapter(source).songList.sortAppliesWithTag !== false
+}
+
 export async function getSongListPage(params: {
   source: DiscoverSourceId
   sortId: string

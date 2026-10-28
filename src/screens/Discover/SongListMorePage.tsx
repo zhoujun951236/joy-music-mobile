@@ -6,18 +6,26 @@ import {
   ListRenderItemInfo,
   NativeScrollEvent,
   NativeSyntheticEvent,
+  Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
+  useWindowDimensions,
 } from 'react-native'
 import { PanGestureHandler } from 'react-native-gesture-handler'
 import { Ionicons } from '@expo/vector-icons'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { borderRadius, BOTTOM_INSET, fontSize, spacing, useTheme } from '../../theme'
-import { discoverSourceList, getSongListPage, getSongListSortList, getSongListTags } from '../../core/discover'
+import {
+  discoverSourceList,
+  getSongListPage,
+  getSongListSortAppliesWithTag,
+  getSongListSortList,
+  getSongListTags,
+} from '../../core/discover'
 import { emitScrollTopState, subscribeScrollToTop } from '../../core/ui/scrollToTopBus'
 import { DiscoverSourceId, SongListItem, SongListTagInfo } from '../../types/discover'
 import { useSwipeBack } from '../../hooks/useSwipeBack'
@@ -102,10 +110,26 @@ export default function SongListMorePage({
   const loadingMoreRef = useRef(false)
   const requestIdRef = useRef(0)
   const listRef = useRef<FlatList<SongListItem> | null>(null)
+  const containerRef = useRef<View>(null)
+  const tagButtonRef = useRef<View>(null)
+
+  const { height: windowHeight } = useWindowDimensions()
+  /** 标签下拉浮层相对页面容器顶部的偏移，打开时量出来 */
+  const [tagAnchorTop, setTagAnchorTop] = useState<number | null>(null)
 
   const sortList = useMemo(() => getSongListSortList(source), [source])
   const safeSortId = localSortId || sortList[0]?.id || 'new'
   const hasMore = page < maxPage
+  // 只有一个排序项时没有可选项，整段隐藏，省得用户以为能切
+  const showSortSection = sortList.length > 1
+  const sortAppliesWithTag = useMemo(() => getSongListSortAppliesWithTag(source), [source])
+  const sortDisabled = !!localTagId && !sortAppliesWithTag
+  /** 浮层高度按剩余可视空间收敛，避免锚点偏低时溢出屏幕底部 */
+  const dropdownMaxHeight = useMemo(() => {
+    if (tagAnchorTop === null) return 260
+    const available = windowHeight - tagAnchorTop - BOTTOM_INSET - spacing.md
+    return Math.max(160, Math.min(320, available))
+  }, [tagAnchorTop, windowHeight])
 
   useEffect(() => {
     const fallbackSortId = sortList[0]?.id || ''
@@ -158,6 +182,18 @@ export default function SongListMorePage({
   }, [allTags])
 
   const selectedTagName = localTagId ? (tagNameMap.get(localTagId) || '未知标签') : '全部标签'
+
+  /**
+   * 切到不支持标签的平台（或该平台标签列表里没有这一项）时，清掉残留的 tagId。
+   * 否则界面上看不到选中的标签，请求里却还带着它。
+   */
+  useEffect(() => {
+    if (tagsLoading || tagsError) return
+    if (!localTagId) return
+    if (tagNameMap.has(localTagId)) return
+    setLocalTagId('')
+    onFiltersChange({ sortId: safeSortId, tagId: '', tagName: '' })
+  }, [tagsLoading, tagsError, localTagId, tagNameMap, safeSortId, onFiltersChange])
 
   /**
    * 加载歌单列表。
@@ -277,6 +313,34 @@ export default function SongListMorePage({
     })
   }, [safeSortId, tagNameMap, onFiltersChange])
 
+  /**
+   * 标签下拉是"浮"在歌单结果之上的，但歌单结果在 FlatList 里、
+   * 下拉在 ListHeaderComponent 里，两者属于不同的 CellRenderer 兄弟节点，
+   * 子树内部的 zIndex 抬不到兄弟节点之上 —— 浮层会被后面的行盖住。
+   * 所以打开时先量一次按钮位置，把浮层渲染到页面级（FlatList 之后）。
+   */
+  const toggleTagDropdown = useCallback(() => {
+    if (showTagDropdown) {
+      setShowTagDropdown(false)
+      return
+    }
+    setShowSourceDropdown(false)
+
+    const button = tagButtonRef.current
+    const container = containerRef.current
+    if (!button || !container) {
+      setTagAnchorTop(null)
+      setShowTagDropdown(true)
+      return
+    }
+    container.measure((_x, _y, _w, _h, _pageX, containerPageY) => {
+      button.measure((_bx, _by, _bw, buttonHeight, _buttonPageX, buttonPageY) => {
+        setTagAnchorTop(buttonPageY - containerPageY + buttonHeight + spacing.xs)
+        setShowTagDropdown(true)
+      })
+    })
+  }, [showTagDropdown])
+
   const handleSourceSelect = useCallback((nextSource: DiscoverSourceId) => {
     setShowSourceDropdown(false)
     setShowTagDropdown(false)
@@ -294,7 +358,8 @@ export default function SongListMorePage({
       key: string,
       label: string,
       active: boolean,
-      onPress: () => void
+      onPress: () => void,
+      disabled = false
     ) => (
       <TouchableOpacity
         key={key}
@@ -303,9 +368,11 @@ export default function SongListMorePage({
           {
             backgroundColor: active ? colors.accent : colors.surface,
             borderColor: active ? colors.accent : colors.separator,
+            opacity: disabled ? 0.4 : 1,
           },
         ]}
         onPress={onPress}
+        disabled={disabled}
         activeOpacity={0.85}
       >
         <Text
@@ -357,81 +424,67 @@ export default function SongListMorePage({
 
   const listHeader = (
     <>
-      <View style={styles.section}>
-        <Text style={[styles.sectionTitle, { color: colors.text }]}>排序</Text>
-        <View style={styles.chipWrap}>
-          {sortList.map(item =>
-            renderChip(
-              `sort-${item.id}`,
-              normalizeSortLabel(item.name),
-              localSortId === item.id,
-              () => handleSortSelect(item.id)
-            )
-          )}
-        </View>
-      </View>
-
-      <View style={[styles.section, showTagDropdown && styles.tagSectionOnTop]}>
-        <Text style={[styles.sectionTitle, { color: colors.text }]}>标签</Text>
-        <View style={styles.tagSelectArea}>
-          <TouchableOpacity
-            style={[
-              styles.tagSelectButton,
-              {
-                backgroundColor: colors.surface,
-                borderColor: colors.separator,
-              },
-            ]}
-            onPress={() => {
-              setShowTagDropdown(v => !v)
-              setShowSourceDropdown(false)
-            }}
-            activeOpacity={0.85}
-          >
-            <Text style={[styles.tagSelectText, { color: colors.text }]}>
-              {selectedTagName}
+      {showSortSection && (
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>排序</Text>
+          <View style={styles.chipWrap}>
+            {sortList.map(item =>
+              renderChip(
+                `sort-${item.id}`,
+                normalizeSortLabel(item.name),
+                localSortId === item.id,
+                () => handleSortSelect(item.id),
+                sortDisabled
+              )
+            )}
+          </View>
+          {sortDisabled && (
+            <Text style={[styles.hintText, { color: colors.textTertiary }]}>
+              该平台选中标签后排序不生效，已置灰
             </Text>
-            <Ionicons
-              name={showTagDropdown ? 'chevron-up' : 'chevron-down'}
-              size={18}
-              color={colors.textSecondary}
-            />
-          </TouchableOpacity>
-
-          {showTagDropdown && (
-            <View
-              style={[
-                styles.dropdown,
-                {
-                  backgroundColor: colors.surfaceElevated,
-                  borderColor: colors.separator,
-                },
-              ]}
-            >
-              <ScrollView
-                nestedScrollEnabled
-                style={styles.dropdownScroll}
-                contentContainerStyle={styles.dropdownTagWrap}
-                showsVerticalScrollIndicator={false}
-              >
-                {renderTagChip('', '全部标签')}
-                {allTags.map(item => renderTagChip(item.id, item.name))}
-              </ScrollView>
-            </View>
           )}
         </View>
+      )}
+
+      <View style={styles.section}>
+        <Text style={[styles.sectionTitle, { color: colors.text }]}>标签</Text>
 
         {tagsLoading ? (
           <View style={styles.loadingRow}>
             <ActivityIndicator size="small" color={colors.accent} />
           </View>
-        ) : null}
-
-        {!!tagsError && (
+        ) : !!tagsError ? (
           <View style={styles.errorRow}>
             <Text style={[styles.errorText, { color: colors.textSecondary }]}>{tagsError}</Text>
             <TouchableOpacity onPress={() => setReloadSeed(v => v + 1)} activeOpacity={0.8}>
               <Text style={[styles.retryText, { color: colors.accent }]}>重试</Text>
+            </TouchableOpacity>
+          </View>
+        ) : allTags.length === 0 ? (
+          <Text style={[styles.hintText, { color: colors.textTertiary }]}>
+            {source.toUpperCase()} 歌单广场不支持标签筛选
+          </Text>
+        ) : (
+          <View ref={tagButtonRef} collapsable={false} style={styles.tagSelectArea}>
+            <TouchableOpacity
+              style={[
+                styles.tagSelectButton,
+                {
+                  backgroundColor: colors.surface,
+                  borderColor: colors.separator,
+                },
+              ]}
+              onPress={toggleTagDropdown}
+              activeOpacity={0.85}
+            >
+              <Text style={[styles.tagSelectText, { color: colors.text }]}>
+                {selectedTagName}
+              </Text>
+              <Ionicons
+                name={showTagDropdown ? 'chevron-up' : 'chevron-down'}
+                size={18}
+                color={colors.textSecondary}
+              />
             </TouchableOpacity>
           </View>
         )}
@@ -515,6 +568,7 @@ export default function SongListMorePage({
       onHandlerStateChange={panGesture.onHandlerStateChange}
     >
       <Animated.View
+        ref={containerRef}
         style={[
           styles.container,
           {
@@ -617,6 +671,8 @@ export default function SongListMorePage({
           onEndReached={handleEndReached}
           onEndReachedThreshold={0.4}
           removeClippedSubviews={false}
+          // 浮层位置是打开那一刻量出来的，滚动会让它和按钮错位，所以打开时锁滚动
+          scrollEnabled={!showTagDropdown}
           showsVerticalScrollIndicator={false}
           refreshControl={
             <RefreshControl
@@ -627,6 +683,35 @@ export default function SongListMorePage({
             />
           }
         />
+
+        {showTagDropdown && (
+          <>
+            <Pressable
+              style={styles.dropdownBackdrop}
+              onPress={() => setShowTagDropdown(false)}
+            />
+            <View
+              style={[
+                styles.dropdown,
+                {
+                  top: tagAnchorTop ?? 0,
+                  backgroundColor: colors.surfaceElevated,
+                  borderColor: colors.separator,
+                },
+              ]}
+            >
+              <ScrollView
+                nestedScrollEnabled
+                style={{ maxHeight: dropdownMaxHeight }}
+                contentContainerStyle={styles.dropdownTagWrap}
+                showsVerticalScrollIndicator={false}
+              >
+                {renderTagChip('', '全部标签')}
+                {allTags.map(item => renderTagChip(item.id, item.name))}
+              </ScrollView>
+            </View>
+          </>
+        )}
       </Animated.View>
     </PanGestureHandler>
   )
@@ -721,13 +806,15 @@ const styles = StyleSheet.create({
   section: {
     marginTop: spacing.lg,
   },
-  tagSectionOnTop: {
-    zIndex: 30,
-  },
   sectionTitle: {
     fontSize: fontSize.title3,
     fontWeight: '700',
     marginBottom: spacing.sm,
+  },
+  hintText: {
+    marginTop: spacing.sm,
+    fontSize: fontSize.footnote,
+    lineHeight: 18,
   },
   resultHeaderRow: {
     flexDirection: 'row',
@@ -764,21 +851,27 @@ const styles = StyleSheet.create({
   },
   dropdown: {
     position: 'absolute',
-    top: 44 + spacing.sm,
-    left: 0,
-    right: 0,
+    // 浮层挂在页面容器上，左右按列表的水平内边距对齐标签按钮
+    left: spacing.md,
+    right: spacing.md,
     borderRadius: borderRadius.md,
     borderWidth: 1,
     overflow: 'hidden',
-    zIndex: 40,
+    zIndex: 90,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 8 },
     shadowOpacity: 0.16,
     shadowRadius: 14,
-    elevation: 12,
+    elevation: 16,
   },
-  dropdownScroll: {
-    maxHeight: 260,
+  dropdownBackdrop: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'transparent',
+    zIndex: 85,
   },
   dropdownTagWrap: {
     flexDirection: 'row',

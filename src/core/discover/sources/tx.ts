@@ -451,6 +451,9 @@ export const txDiscoverSource: DiscoverSourceAdapter = {
   name: 'QQ Music',
   songList: {
     sortList,
+    // 选中标签时走的是 get_category_content，它的 param 里没有 order 字段，
+    // getList 只会把 order 发给未选标签的 get_playlist_by_tag 分支。
+    sortAppliesWithTag: false,
     getTags,
     getList,
     getListDetail,

@@ -13,18 +13,14 @@ import { normalizeImageUrl } from '../../../utils/url'
 const SONG_LIMIT = 30
 const TOP_LIMIT = 100
 
-const sortList = [
-  { id: '5', tid: 'recommend', name: 'Recommend' },
-  { id: '6', tid: 'hot', name: 'Hot' },
-  { id: '7', tid: 'new', name: 'New' },
-  { id: '8', tid: 'rise', name: 'Rise' },
-]
-const KG_FALLBACK_HOT_TAGS: SongListTagInfo[] = [
-  { id: 'dj', name: 'DJ', source: 'kg' },
-  { id: 'hot', name: '热门', source: 'kg' },
-  { id: 'acg', name: 'ACG', source: 'kg' },
-  { id: 'classic', name: '经典', source: 'kg' },
-]
+/**
+ * m.kugou.com/plist/index 只接受 json / page 两个参数，既不认排序也不认标签
+ * （见 fetchKgPlaylistPage）。所以这里只声明一个排序项：
+ * 之前列出 推荐/最热/最新/飙升 四项，但 getList 从不把 sortId 发出去，
+ * 点了哪个结果都一样 —— 也就是"切换后歌单结果没有变化"的根因。
+ */
+const sortList = [{ id: '5', tid: 'recommend', name: 'Recommend' }]
+const KG_FALLBACK_HOT_TAGS: SongListTagInfo[] = []
 
 const STATIC_TOP_LIST = [
   { id: 'kg__8888', name: 'TOP500', bangId: '8888' },
@@ -311,8 +307,8 @@ async function fetchPlaylistInfoFromHtml(
 }
 
 async function getTags(): Promise<{ tags: SongListTagInfo[]; hotTags: SongListTagInfo[] }> {
-  // m.kugou 的歌单广场未提供稳定标签接口，这里返回安全兜底标签，
-  // 保证筛选 UI 可用且不会触发网络报错。
+  // m.kugou 的歌单广场接口不认标签参数，返回任何标签都会是"点了没反应"的假控件，
+  // 所以这里明确返回空，由 UI 显示"该平台暂不支持标签筛选"。
   return {
     tags: [],
     hotTags: KG_FALLBACK_HOT_TAGS,

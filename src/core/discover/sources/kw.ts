@@ -14,6 +14,13 @@ const SONG_LIMIT = 36
 const DETAIL_LIMIT = 100
 const TOP_LIMIT = 100
 
+/**
+ * 酷我的标签 id 形如 `${id}-${digest}`，但只有 digest 为 10000 的标签
+ * 才能通过 getTagPlayList 取到内容（见 getSongList）。
+ * 其余标签发出去也不会改变结果，所以干脆不在筛选 UI 里展示。
+ */
+const TAG_PLAYLIST_DIGEST = '10000'
+
 const sortList = [
   { id: 'new', tid: 'new', name: 'Newest' },
   { id: 'hot', tid: 'hot', name: 'Hot' },
@@ -151,6 +158,8 @@ async function getSongListTags(): Promise<{ tags: SongListTagInfo[]; hotTags: So
   const rawTypes = tagsResp.data?.data || []
   for (const typeItem of rawTypes) {
     for (const item of typeItem.data || []) {
+      // 只暴露真正能生效的标签，避免"点了没反应"
+      if (String(item.digest) !== TAG_PLAYLIST_DIGEST) continue
       tags.push({
         id: `${item.id}-${item.digest}`,
         name: item.name,
@@ -161,11 +170,13 @@ async function getSongListTags(): Promise<{ tags: SongListTagInfo[]; hotTags: So
     }
   }
 
-  const hotTags: SongListTagInfo[] = (hotResp.data?.data?.[0]?.data || []).map((item: any) => ({
-    id: `${item.id}-${item.digest}`,
-    name: item.name,
-    source: 'kw',
-  }))
+  const hotTags: SongListTagInfo[] = (hotResp.data?.data?.[0]?.data || [])
+    .filter((item: any) => String(item.digest) === TAG_PLAYLIST_DIGEST)
+    .map((item: any) => ({
+      id: `${item.id}-${item.digest}`,
+      name: item.name,
+      source: 'kw',
+    }))
 
   return { tags, hotTags }
 }
@@ -183,7 +194,7 @@ async function getSongList(sortId: string, tagId: string, page: number): Promise
 
   if (tagId) {
     const [id, digest] = tagId.split('-')
-    if (digest === '10000') {
+    if (digest === TAG_PLAYLIST_DIGEST) {
       url = 'https://wapi.kuwo.cn/api/pc/classify/playlist/getTagPlayList'
       query = { ...query, id }
     }
