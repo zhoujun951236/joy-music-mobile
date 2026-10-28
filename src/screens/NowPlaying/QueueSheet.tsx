@@ -23,6 +23,7 @@ import {
   FlatList,
   ListRenderItemInfo,
   Platform,
+  TextInput,
 } from 'react-native';
 import DraggableFlatList, {
   RenderItemParams,
@@ -33,6 +34,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useDispatch, useSelector } from 'react-redux';
 import { useTheme, spacing, fontSize, borderRadius } from '../../theme';
 import { playerController } from '../../core/player';
+import { matchesQueueSearch, normalizeQueueQuery } from '../../core/player/queueSearch';
 import { clearTrackCacheById } from '../../core/music/cache';
 import type { RootState } from '../../store';
 import type { Track } from '../../types/music';
@@ -130,18 +132,57 @@ function QueueSheet({
     [queueRenderData],
   );
 
+  /* ── 列表内搜索 ──
+   *
+   *   关键点：搜索只是"过滤显示"，绝不改变真实队列。
+   *   因为 handleQueueTrackPress 会把传给它的数组整体写进 playerController
+   *   （playFromPlaylist 内部 this.playlist = [...playlist]），
+   *   所以点击命中项时必须换算回原始队列下标、并仍然传完整队列，
+   *   否则点一下搜索结果就会把播放列表替换成只剩匹配的那几首。
+   */
+  const [searchQuery, setSearchQuery] = useState('');
+
+  const normalizedQuery = useMemo(() => normalizeQueueQuery(searchQuery), [searchQuery]);
+  const isSearchActive = normalizedQuery.length > 0;
+
+  /** 每首歌在真实队列中的下标，用于显示序号与点击播放 */
+  const queueIndexByIdentity = useMemo(() => {
+    const map = new Map<string, number>();
+    queueRenderData.forEach((track, index) => {
+      const key = getTrackIdentity(track);
+      if (!map.has(key)) map.set(key, index);
+    });
+    return map;
+  }, [getTrackIdentity, queueRenderData]);
+
+  const displayData = useMemo(() => {
+    if (!isSearchActive) return queueRenderData;
+    return queueRenderData.filter((track) => matchesQueueSearch(track, normalizedQuery));
+  }, [isSearchActive, normalizedQuery, queueRenderData]);
+
+  const matchCount = displayData.length;
+
+  /** 把某首歌换算回它在真实队列里的下标 */
+  const resolveQueueIndex = useCallback(
+    (track: Track, fallback: number) => {
+      const index = queueIndexByIdentity.get(getTrackIdentity(track));
+      return index === undefined ? fallback : index;
+    },
+    [getTrackIdentity, queueIndexByIdentity],
+  );
+
   /* ── 当前播放在队列中的位置，决定打开 sheet 时 FlatList 自动滚到哪一行 ── */
   const currentRenderIndex = useMemo(() => {
     if (!isValidTrack(renderTrack)) return -1;
     const targetId = getTrackIdentity(renderTrack);
-    return queueRenderData.findIndex((track) => getTrackIdentity(track) === targetId);
-  }, [getTrackIdentity, isValidTrack, queueRenderData, renderTrack]);
+    return displayData.findIndex((track) => getTrackIdentity(track) === targetId);
+  }, [displayData, getTrackIdentity, isValidTrack, renderTrack]);
 
   const initialScrollIndex = useMemo(() => {
     if (currentRenderIndex < 0) return undefined;
-    if (currentRenderIndex >= queueRenderData.length) return undefined;
+    if (currentRenderIndex >= displayData.length) return undefined;
     return currentRenderIndex;
-  }, [currentRenderIndex, queueRenderData.length]);
+  }, [currentRenderIndex, displayData.length]);
 
   /* ── 仅在 sheet 从关闭 → 打开的瞬间滚到当前歌曲一次。
    *
@@ -204,6 +245,8 @@ function QueueSheet({
     // 关闭时若仍在排序模式视为放弃修改
     setIsReorderMode(false);
     setReorderDraft([]);
+    // 搜索是临时视图，关掉面板就清掉，下次进来还是完整队列
+    setSearchQuery('');
     Animated.timing(animValue, {
       toValue: 0,
       duration: 200,
@@ -435,6 +478,9 @@ function QueueSheet({
   const [reorderDraft, setReorderDraft] = useState<Track[]>([]);
 
   const enterReorderMode = useCallback(() => {
+    // 拖动排序依赖"显示下标 == 真实队列下标"，所以进入排序模式先退出搜索，
+    // 否则在筛选结果里拖动会把歌挪到完全无关的位置。
+    setSearchQuery('');
     setReorderDraft(queueRenderData.slice());
     setIsReorderMode(true);
   }, [queueRenderData]);
@@ -481,6 +527,10 @@ function QueueSheet({
       if (!track) return null;
       const idx = getIndex?.() ?? 0;
       const safeIndex = idx >= 0 ? idx : 0;
+      // 搜索状态下"显示下标"不等于"队列下标"，序号和播放都要用真实队列下标。
+      // 排序模式例外：那时 data 是 reorderDraft，safeIndex 就是拖动后的实时位置，
+      // 序号必须跟着行走，不能被映射回原始下标。
+      const queueIndex = isReorderMode ? safeIndex : resolveQueueIndex(track, safeIndex);
       const isCurrent = renderTrack
         ? getTrackIdentity(track) === getTrackIdentity(renderTrack)
         : false;
@@ -492,7 +542,7 @@ function QueueSheet({
             onPress={() => {
               if (isActive) return;
               if (isReorderMode) return; // 排序模式下不响应短按播放
-              void handleQueueTrackPress(safeIndex);
+              void handleQueueTrackPress(queueIndex);
             }}
             // 仅排序模式下整行长按可触发拖动；默认态不触发，避免误触。
             onLongPress={isReorderMode ? drag : undefined}
@@ -527,7 +577,7 @@ function QueueSheet({
                   { color: isCurrent ? colors.accent : colors.textTertiary },
                 ]}
               >
-                {safeIndex + 1}
+                {queueIndex + 1}
               </Text>
             </View>
             <View style={styles.queueItemInfo}>
@@ -603,6 +653,7 @@ function QueueSheet({
       isPlaying,
       isReorderMode,
       renderTrack,
+      resolveQueueIndex,
     ],
   );
 
@@ -693,8 +744,11 @@ function QueueSheet({
                     styles.queueSheetCount,
                     { color: colors.textSecondary },
                   ]}
+                  numberOfLines={1}
                 >
-                  共 {queueDisplayCount} 首
+                  {isSearchActive
+                    ? `匹配 ${matchCount} / 共 ${queueDisplayCount} 首`
+                    : `共 ${queueDisplayCount} 首`}
                 </Text>
                 <TouchableOpacity
                   style={[
@@ -725,11 +779,13 @@ function QueueSheet({
                       backgroundColor: isDark
                         ? 'rgba(255,255,255,0.08)'
                         : 'rgba(0,0,0,0.04)',
-                      opacity: queueDisplayCount > 0 ? 1 : 0.45,
+                      opacity: queueDisplayCount > 0 && !isSearchActive ? 1 : 0.45,
                     },
                   ]}
                   activeOpacity={0.78}
-                  disabled={queueDisplayCount <= 0}
+                  // 搜索状态下禁用：清空清的是整个队列，不是筛出来的那几首，
+                  // 在只剩几条的视图里点它太容易误操作。
+                  disabled={queueDisplayCount <= 0 || isSearchActive}
                   onPress={handleClearQueue}
                 >
                   <Ionicons
@@ -743,8 +799,46 @@ function QueueSheet({
           </View>
         </View>
 
+        {!isReorderMode && (
+          <View style={styles.queueSearchRow}>
+            <View
+              style={[
+                styles.queueSearchBox,
+                {
+                  backgroundColor: isDark
+                    ? 'rgba(255,255,255,0.08)'
+                    : 'rgba(0,0,0,0.04)',
+                  borderColor: colors.separator,
+                },
+              ]}
+            >
+              <Ionicons name="search" size={15} color={colors.textTertiary} />
+              <TextInput
+                value={searchQuery}
+                onChangeText={setSearchQuery}
+                placeholder="搜索歌名 / 歌手 / 专辑"
+                placeholderTextColor={colors.textTertiary}
+                style={[styles.queueSearchInput, { color: colors.text }]}
+                autoCorrect={false}
+                autoCapitalize="none"
+                returnKeyType="search"
+                selectionColor={colors.accent}
+              />
+              {isSearchActive && (
+                <Pressable
+                  hitSlop={8}
+                  style={styles.queueSearchClear}
+                  onPress={() => setSearchQuery('')}
+                >
+                  <Ionicons name="close-circle" size={16} color={colors.textTertiary} />
+                </Pressable>
+              )}
+            </View>
+          </View>
+        )}
+
         <View style={styles.queueListGestureLayer}>
-          {queueRenderData.length === 0 ? (
+          {displayData.length === 0 ? (
             <View style={styles.queueEmptyState}>
               <Text
                 style={[
@@ -752,8 +846,21 @@ function QueueSheet({
                   { color: colors.textSecondary },
                 ]}
               >
-                暂无可展示的歌曲
+                {isSearchActive
+                  ? `没有找到与「${searchQuery.trim()}」匹配的歌曲`
+                  : '暂无可展示的歌曲'}
               </Text>
+              {isSearchActive && (
+                <TouchableOpacity
+                  style={styles.queueEmptyAction}
+                  activeOpacity={0.8}
+                  onPress={() => setSearchQuery('')}
+                >
+                  <Text style={[styles.queueEmptyActionText, { color: colors.accent }]}>
+                    清空搜索
+                  </Text>
+                </TouchableOpacity>
+              )}
             </View>
           ) : (
             <DraggableFlatList
@@ -763,11 +870,14 @@ function QueueSheet({
               containerStyle={styles.queueSheetScroll}
               style={styles.queueSheetScroll}
               contentContainerStyle={styles.queueSheetList}
-              data={isReorderMode ? reorderDraft : queueRenderData}
+              data={isReorderMode ? reorderDraft : displayData}
               // 注意：keyExtractor 必须 stable（不能拼 index），否则 DraggableFlatList
               // 在 reorder 时 key 跟着变 → React unmount/mount → lib 的 activeKey 失效
               // → 长按那瞬间会自动跟相邻行对调（症状："长按第 52 立刻跳到 53"）。
               keyExtractor={(track) => getTrackIdentity(track)}
+              // 搜索时键盘是弹起的，默认 "never" 会让第一次点击只用来收键盘、
+              // 点不中结果行；"handled" 让点击直接命中。
+              keyboardShouldPersistTaps="handled"
               showsVerticalScrollIndicator={false}
               renderItem={renderQueueItem}
               onDragEnd={handleDragEnd}
@@ -874,6 +984,40 @@ const styles = StyleSheet.create({
   },
   queueEmptyText: {
     fontSize: fontSize.callout,
+    textAlign: 'center',
+  },
+  queueEmptyAction: {
+    marginTop: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.xs,
+  },
+  queueEmptyActionText: {
+    fontSize: fontSize.footnote,
+    fontWeight: '700',
+  },
+  queueSearchRow: {
+    paddingHorizontal: spacing.md,
+    paddingBottom: spacing.sm,
+  },
+  queueSearchBox: {
+    height: 36,
+    borderRadius: borderRadius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: spacing.sm,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+  },
+  queueSearchInput: {
+    flex: 1,
+    fontSize: fontSize.subhead,
+    paddingVertical: 0,
+  },
+  queueSearchClear: {
+    width: 22,
+    height: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   queueItem: {
     height: QUEUE_ITEM_HEIGHT,
