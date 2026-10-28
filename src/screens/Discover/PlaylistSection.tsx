@@ -25,8 +25,9 @@ interface PlaylistSectionProps {
 
 /**
  * 渲染歌单卡片（封面 + 播放量角标 + 名称）。
+ * 导出给分页列表（SongListMorePage）复用，保证两处卡片样式一致。
  */
-function PlaylistCard({
+export function PlaylistCard({
   item,
   onPress,
 }: {
