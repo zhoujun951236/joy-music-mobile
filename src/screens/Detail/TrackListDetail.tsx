@@ -2,7 +2,7 @@
  * Track list detail screen for leaderboard/playlist detail views
  */
 
-import React, { useCallback, useEffect, useMemo, useRef } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   View,
   Text,
@@ -14,6 +14,7 @@ import {
   Animated,
   NativeScrollEvent,
   NativeSyntheticEvent,
+  TextInput,
 } from 'react-native'
 import { LinearGradient } from 'expo-linear-gradient'
 import { BlurView } from 'expo-blur'
@@ -27,6 +28,7 @@ import { useSwipeBack } from '../../hooks/useSwipeBack'
 import { Track, type TrackMoreActionHandler } from '../../types/music'
 import { emitScrollTopState, subscribeScrollToTop } from '../../core/ui/scrollToTopBus'
 import { normalizeImageUrl } from '../../utils/url'
+import { filterQueueWithIndex, normalizeQueueQuery } from '../../core/player/queueSearch'
 import { RootState } from '../../store'
 
 const SCREEN_WIDTH = Dimensions.get('window').width
@@ -65,6 +67,30 @@ export default function TrackListDetail({
   const isPlaying = useSelector((state: RootState) => state.player.isPlaying)
   const { panX, panGesture } = useSwipeBack(onBack)
   const listRef = useRef<FlatList<Track> | null>(null)
+
+  /* ── 列表内搜索 ──
+   *
+   *   只过滤"显示"，不动数据源：
+   *   - 播放全部 走的是 App 里的 detailView.tracks，与这里的过滤结果无关；
+   *   - 点歌走 onTrackPress(track)，传的是对象不是下标。
+   *   所以过滤不会改变播放队列，也不会让"播放全部"只播匹配到的那几首。
+   */
+  const [searchKeyword, setSearchKeyword] = useState('')
+  const isSearchActive = normalizeQueueQuery(searchKeyword).length > 0
+
+  /** 命中项 + 它们在【原歌单】里的下标，行号继续显示原始位置 */
+  const matchedTracks = useMemo(
+    () => filterQueueWithIndex(tracks, searchKeyword),
+    [searchKeyword, tracks]
+  )
+  const visibleTracks = useMemo(() => matchedTracks.map((entry) => entry.track), [matchedTracks])
+  const originalIndexByTrackId = useMemo(() => {
+    const map = new Map<string, number>()
+    matchedTracks.forEach((entry) => {
+      if (!map.has(entry.track.id)) map.set(entry.track.id, entry.index)
+    })
+    return map
+  }, [matchedTracks])
 
   const normalizedCoverUrl = useMemo(() => normalizeImageUrl(coverUrl, 500), [coverUrl])
   const headerCoverSource = useMemo(
@@ -174,36 +200,82 @@ export default function TrackListDetail({
           </TouchableOpacity>
         )}
       </View>
+
+      {/* 搜索框：位于「播放全部 / 收藏」之下、第一首歌之上 */}
+      <View
+        style={[
+          styles.searchRow,
+          { backgroundColor: colors.surface, borderColor: colors.separator },
+        ]}
+      >
+        <Ionicons name="search-outline" size={16} color={colors.textTertiary} />
+        <TextInput
+          value={searchKeyword}
+          onChangeText={setSearchKeyword}
+          placeholder="在本歌单中搜索歌名 / 歌手 / 专辑"
+          placeholderTextColor={colors.textTertiary}
+          style={[styles.searchInput, { color: colors.text }]}
+          autoCorrect={false}
+          autoCapitalize="none"
+          returnKeyType="search"
+          selectionColor={colors.accent}
+        />
+        {!!searchKeyword && (
+          <TouchableOpacity
+            style={styles.searchClearBtn}
+            hitSlop={8}
+            activeOpacity={0.7}
+            onPress={() => setSearchKeyword('')}
+          >
+            <Ionicons name="close-circle" size={18} color={colors.textTertiary} />
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {isSearchActive && (
+        <Text style={[styles.searchMeta, { color: colors.textSecondary }]}>
+          匹配 {matchedTracks.length} / 共 {tracks.length} 首
+        </Text>
+      )}
     </View>
   ), [
     colors.accent,
     colors.separator,
     colors.surface,
     colors.surfaceSecondary,
+    colors.text,
+    colors.textSecondary,
     colors.textTertiary,
     description,
     favoriteDisabled,
     gradientColors,
     headerCoverSource,
     insets.top,
+    isSearchActive,
+    matchedTracks.length,
     onBack,
     onFavorite,
     onPlayAll,
+    searchKeyword,
     title,
     tracks.length,
   ])
 
-  const renderTrackItem = useCallback(({ item, index }: { item: Track; index: number }) => (
-      <TrackListItem
-        track={item}
-        index={index}
-        showIndex
-        isCurrentTrack={currentTrackId === item.id}
-        isPlaying={isPlaying && currentTrackId === item.id}
-        onPress={onTrackPress}
-        onMorePress={onTrackMorePress}
-      />
-    ), [currentTrackId, isPlaying, onTrackPress, onTrackMorePress])
+  const renderTrackItem = useCallback(({ item, index }: { item: Track; index: number }) => {
+      // 搜索时 index 是"过滤后"的位置，行号要显示它在原歌单里的位置
+      const originalIndex = originalIndexByTrackId.get(item.id) ?? index
+      return (
+        <TrackListItem
+          track={item}
+          index={originalIndex}
+          showIndex
+          isCurrentTrack={currentTrackId === item.id}
+          isPlaying={isPlaying && currentTrackId === item.id}
+          onPress={onTrackPress}
+          onMorePress={onTrackMorePress}
+        />
+      )
+    }, [currentTrackId, isPlaying, onTrackMorePress, onTrackPress, originalIndexByTrackId])
 
   return (
     <PanGestureHandler
@@ -226,9 +298,30 @@ export default function TrackListDetail({
           ref={listRef}
           onScroll={handleScroll}
           scrollEventThrottle={16}
-          data={tracks}
+          data={visibleTracks}
           keyExtractor={(item) => item.id}
           ListHeaderComponent={listHeader}
+          ListEmptyComponent={
+            <View style={styles.emptyWrap}>
+              <Text style={[styles.emptyText, { color: colors.textSecondary }]}>
+                {isSearchActive
+                  ? `没有找到与「${searchKeyword.trim()}」匹配的歌曲`
+                  : '这个歌单还没有歌曲'}
+              </Text>
+              {isSearchActive && (
+                <TouchableOpacity
+                  style={styles.emptyAction}
+                  activeOpacity={0.8}
+                  onPress={() => setSearchKeyword('')}
+                >
+                  <Text style={[styles.emptyActionText, { color: colors.accent }]}>清空搜索</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          }
+          // 搜索时键盘是弹起的，默认 "never" 会让第一次点击只用来收键盘、
+          // 点不中歌曲行；"handled" 让点击直接命中。
+          keyboardShouldPersistTaps="handled"
           contentContainerStyle={{ paddingBottom: BOTTOM_INSET + spacing.md }}
           renderItem={renderTrackItem}
         />
@@ -316,6 +409,54 @@ const styles = StyleSheet.create({
   },
   favoriteText: {
     fontSize: fontSize.callout,
+    fontWeight: '700',
+  },
+  searchRow: {
+    marginHorizontal: spacing.md,
+    // actionRow 已经有 paddingVertical，这里只补一点下间距
+    marginBottom: spacing.sm,
+    minHeight: 40,
+    borderRadius: borderRadius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: spacing.sm,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+  },
+  searchInput: {
+    flex: 1,
+    fontSize: fontSize.footnote,
+    fontWeight: '500',
+    paddingVertical: 0,
+  },
+  searchClearBtn: {
+    width: 24,
+    height: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  searchMeta: {
+    marginHorizontal: spacing.md,
+    marginBottom: spacing.sm,
+    fontSize: fontSize.caption1,
+  },
+  emptyWrap: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: spacing.xxl,
+    paddingHorizontal: spacing.lg,
+  },
+  emptyText: {
+    fontSize: fontSize.callout,
+    textAlign: 'center',
+  },
+  emptyAction: {
+    marginTop: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.xs,
+  },
+  emptyActionText: {
+    fontSize: fontSize.footnote,
     fontWeight: '700',
   },
 })

@@ -113,3 +113,38 @@ describe('filterQueueWithIndex', () => {
     expect(filterQueueWithIndex(queue, undefined as any)).toHaveLength(queue.length)
   })
 })
+
+/**
+ * 歌单详情页（TrackListDetail）就是按这个用法接的：
+ * 用 filterQueueWithIndex 的结果建一张 id → 原始下标 的表，
+ * 渲染时把 FlatList 给的"过滤后下标"换回原歌单位置当行号。
+ */
+describe('歌单详情页行号映射', () => {
+  function buildIndexMap(list: Track[], query: string) {
+    const matched = filterQueueWithIndex(list, query)
+    const map = new Map<string, number>()
+    matched.forEach((entry) => {
+      if (!map.has(entry.track.id)) map.set(entry.track.id, entry.index)
+    })
+    return { matched, visible: matched.map((entry) => entry.track), map }
+  }
+
+  it('过滤后行号仍是原歌单里的位置', () => {
+    const { visible, map } = buildIndexMap(queue, '周杰伦')
+    // 过滤后列表只有 3 条，下标是 0/1/2
+    expect(visible).toHaveLength(3)
+    // 但映射回原歌单应该是 1/2/4（第 1、2、4 首）
+    expect(visible.map((track) => (map.get(track.id) ?? -1) + 1)).toEqual([1, 2, 4])
+  })
+
+  it('不搜索时行号与过滤后下标一致', () => {
+    const { visible, map } = buildIndexMap(queue, '')
+    expect(visible.map((track, i) => map.get(track.id) ?? -1)).toEqual([0, 1, 2, 3, 4])
+  })
+
+  it('重复 id 只记第一次出现的位置', () => {
+    const duplicated = [...queue, queue[0]]
+    const { map } = buildIndexMap(duplicated, '')
+    expect(map.get(queue[0].id)).toBe(0)
+  })
+})

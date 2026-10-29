@@ -432,8 +432,8 @@ export default function PlaylistScreen({ onTrackPress, onTrackMorePress, onPlayA
     () => playlists.find((item) => item.id === selectedPlaylistId) || null,
     [playlists, selectedPlaylistId],
   )
+  const [isDetailSearchVisible, setIsDetailSearchVisible] = useState(false)
   const [detailSearchKeyword, setDetailSearchKeyword] = useState('')
-  const detailSearchInputRef = useRef<TextInput>(null)
   const [detailSortMode, setDetailSortMode] = useState<DetailTrackSortMode>('default')
   const normalizedDetailSearchKeyword = useMemo(
     () => detailSearchKeyword.trim().toLowerCase(),
@@ -536,6 +536,7 @@ export default function PlaylistScreen({ onTrackPress, onTrackMorePress, onPlayA
   }, [detailSortMode, normalizedDetailSearchKeyword, selectedPlaylistId])
 
   useEffect(() => {
+    setIsDetailSearchVisible(false)
     setDetailSearchKeyword('')
     setDetailSortMode('default')
   }, [selectedPlaylistId])
@@ -864,18 +865,14 @@ export default function PlaylistScreen({ onTrackPress, onTrackMorePress, onPlayA
     Alert.alert('提示', '评论功能正在规划中')
   }, [])
 
-  /**
-   * 搜索框现在常驻显示，所以 🔍 按钮不再负责"展开/收起"，
-   * 改成把列表滚回顶部并聚焦输入框 —— 长歌单滚到中间时也能一键回到搜索。
-   */
-  const handleFocusDetailSearch = useCallback(() => {
-    try {
-      detailListRef.current?.scrollToOffset?.({ offset: 0, animated: true })
-    } catch {
-      // 列表尚未挂载时忽略
-    }
-    // 等滚动把输入框带回键盘上方再聚焦，否则键盘会盖住它
-    setTimeout(() => detailSearchInputRef.current?.focus(), 220)
+  const handleToggleDetailSearch = useCallback(() => {
+    setIsDetailSearchVisible((prev) => {
+      const next = !prev
+      if (!next) {
+        setDetailSearchKeyword('')
+      }
+      return next
+    })
   }, [])
 
   const handleOpenDetailSortMenu = useCallback(() => {
@@ -1186,6 +1183,7 @@ export default function PlaylistScreen({ onTrackPress, onTrackMorePress, onPlayA
     const sourceLabel = getPlaylistDisplayLabel(selectedPlaylist)
     const canFavoritePlaylist = false
     const detailFilteredCount = detailProcessedTracks.length
+    const showDetailSearchPanel = isDetailSearchVisible || normalizedDetailSearchKeyword.length > 0
     const detailListMetaLabel = normalizedDetailSearchKeyword
       ? `共 ${detailFilteredCount}/${selectedPlaylist.tracks.length} 首 · ${DETAIL_TRACK_SORT_LABEL[detailSortMode]}`
       : `共 ${detailFilteredCount} 首 · ${DETAIL_TRACK_SORT_LABEL[detailSortMode]}`
@@ -1215,9 +1213,6 @@ export default function PlaylistScreen({ onTrackPress, onTrackMorePress, onPlayA
             ref={detailListRef as any}
             onScroll={handleDetailListScroll}
             scrollEventThrottle={16}
-            // 搜索时键盘是弹起的，默认 "never" 会让第一次点击只用来收键盘、
-            // 点不中歌曲行；"handled" 让点击直接命中。
-            keyboardShouldPersistTaps="handled"
             data={isReorderMode ? reorderDraft : detailVisibleTracks}
             // keyExtractor 必须 stable（不拼 index），详见 QueueSheet 的注释
             keyExtractor={(item) => item.id}
@@ -1333,7 +1328,7 @@ export default function PlaylistScreen({ onTrackPress, onTrackMorePress, onPlayA
                 <View style={styles.detailPlayTools}>
                   <Pressable
                     style={({ pressed }) => [styles.detailToolBtn, { opacity: pressed ? 0.82 : 1 }]}
-                    onPress={handleFocusDetailSearch}
+                    onPress={handleToggleDetailSearch}
                   >
                     <Ionicons name="search-outline" size={18} color={colors.textSecondary} />
                   </Pressable>
@@ -1358,31 +1353,27 @@ export default function PlaylistScreen({ onTrackPress, onTrackMorePress, onPlayA
                 </View>
               </View>
 
-              {/* 搜索框常驻显示：位于歌单描述与播放卡片之下、歌曲列表之上 */}
-              <View style={[styles.detailSearchRow, { backgroundColor: colors.surface, borderColor: colors.separator }]}>
-                <Ionicons name="search-outline" size={16} color={colors.textSecondary} />
-                <TextInput
-                  ref={detailSearchInputRef}
-                  value={detailSearchKeyword}
-                  onChangeText={setDetailSearchKeyword}
-                  placeholder="搜索歌名 / 歌手 / 专辑"
-                  placeholderTextColor={colors.textTertiary}
-                  style={[styles.detailSearchInput, { color: colors.text }]}
-                  autoCorrect={false}
-                  autoCapitalize="none"
-                  returnKeyType="search"
-                  selectionColor={colors.accent}
-                />
-                {!!detailSearchKeyword && (
-                  <Pressable
-                    style={styles.detailSearchClearBtn}
-                    hitSlop={8}
-                    onPress={() => setDetailSearchKeyword('')}
-                  >
-                    <Ionicons name="close-circle" size={18} color={colors.textTertiary} />
-                  </Pressable>
-                )}
-              </View>
+              {showDetailSearchPanel && (
+                <View style={[styles.detailSearchRow, { backgroundColor: colors.surface, borderColor: colors.separator }]}>
+                  <Ionicons name="search-outline" size={16} color={colors.textSecondary} />
+                  <TextInput
+                    value={detailSearchKeyword}
+                    onChangeText={setDetailSearchKeyword}
+                    placeholder="搜索歌名 / 歌手 / 专辑"
+                    placeholderTextColor={colors.textTertiary}
+                    style={[styles.detailSearchInput, { color: colors.text }]}
+                    returnKeyType="search"
+                  />
+                  {!!detailSearchKeyword && (
+                    <Pressable
+                      style={styles.detailSearchClearBtn}
+                      onPress={() => setDetailSearchKeyword('')}
+                    >
+                      <Ionicons name="close-circle" size={18} color={colors.textTertiary} />
+                    </Pressable>
+                  )}
+                </View>
+              )}
 
               {!!currentTrackTitle && (
                 <View style={styles.detailContinueRow}>
